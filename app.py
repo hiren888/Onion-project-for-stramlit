@@ -21,28 +21,31 @@ def get_circularity(contour):
     return 4 * np.pi * (area / (perimeter * perimeter))
 
 def main():
-    st.set_page_config(page_title="Onion AI: Master Grader", layout="wide")
-    st.title("🧅 Onion AI: Master Grader")
-    st.markdown("### Final Polish Mode")
-
+    st.set_page_config(page_title="Onion AI: Final + Saturation", layout="wide")
+    st.title("🧅 Onion AI: Final Grader (With Saturation Control)")
+    
     # --- Sidebar ---
-    st.sidebar.header("1. Detection & Filters")
+    st.sidebar.header("1. Detection Filters")
     min_size_mm = st.sidebar.number_input("Min Onion Size (mm)", value=45.0)
-    min_circularity = st.sidebar.slider("Roundness Filter", 0.1, 1.0, 0.6, help="1.0 is a perfect circle. 0.6 allows slightly oval onions. Increase to remove long/messy objects.")
+    min_circularity = st.sidebar.slider("Roundness Filter", 0.1, 1.0, 0.5, help="Lower this to 0.4 or 0.5 if oval onions are being missed.")
     
     st.sidebar.header("2. Color Tuning")
-    with st.sidebar.expander("Show Color Settings"):
+    with st.sidebar.expander("Show Color Settings", expanded=True):
         st.write("**Green Cap**")
         c_h_min = st.slider("Green Hue Min", 0, 179, 35)
         c_h_max = st.slider("Green Hue Max", 0, 179, 95) 
-        st.write("**Red Onion**")
+        
+        st.markdown("---")
+        st.write("**Red Onion (The Fix)**")
+        st.caption("Lower 'Saturation Min' to detect pale/dry onions.")
         o_h_min = st.slider("Red Hue Min", 0, 179, 0)
         o_h_max = st.slider("Red Hue Max", 0, 179, 179)
-        o_v_min = st.slider("Red Value Min", 0, 255, 50)
+        o_s_min = st.slider("Red Saturation Min", 0, 255, 25) # Default lowered to 25 to catch pale onions
+        o_v_min = st.slider("Red Value (Brightness) Min", 0, 255, 50)
 
     st.sidebar.header("3. Calibration")
     ref_width_mm = st.sidebar.number_input("Real Cap Size (mm)", value=30.0)
-    calib_factor = st.sidebar.slider("Fine Tune %", 90, 110, 100, help="If measurements are consistently off, adjust this.") / 100.0
+    calib_factor = st.sidebar.slider("Fine Tune %", 90, 110, 100) / 100.0
     
     # --- Upload ---
     uploaded_file = st.file_uploader("Upload Image", type=['jpg', 'png', 'jpeg'])
@@ -55,12 +58,12 @@ def main():
 
         # --- MASKS ---
         # Green Mask
-        mask_cap = cv2.inRange(hsv, np.array([c_h_min, 60, 50]), np.array([c_h_max, 255, 255]))
+        mask_cap = cv2.inRange(hsv, np.array([c_h_min, 50, 50]), np.array([c_h_max, 255, 255]))
         kernel = np.ones((5, 5), np.uint8)
         mask_cap = cv2.morphologyEx(mask_cap, cv2.MORPH_OPEN, kernel)
         
-        # Red Mask
-        mask_onion = cv2.inRange(hsv, np.array([o_h_min, 50, o_v_min]), np.array([o_h_max, 255, 255]))
+        # Red Mask (Now uses the Slider Variable o_s_min)
+        mask_onion = cv2.inRange(hsv, np.array([o_h_min, o_s_min, o_v_min]), np.array([o_h_max, 255, 255]))
         mask_onion = cv2.morphologyEx(mask_onion, cv2.MORPH_CLOSE, kernel)
         mask_onion = cv2.dilate(mask_onion, kernel, iterations=1)
 
@@ -91,15 +94,15 @@ def main():
             cnts_onion = get_contours(mask_onion, 200)
             
             for cnt in cnts_onion:
-                # --- Filter: Circularity ---
+                # Filter: Circularity
                 circ = get_circularity(cnt)
                 if circ < min_circularity:
-                    continue # Skip objects that aren't round enough
+                    continue 
 
                 w_px = get_min_axis_width(cnt)
                 w_mm = w_px / scale
                 
-                # --- Filter: Size ---
+                # Filter: Size
                 if w_mm < min_size_mm:
                     continue 
 
@@ -115,21 +118,18 @@ def main():
                 box = box.astype(int)
                 cv2.drawContours(display_img, [box], 0, (0, 255, 0), 2)
                 
-                # Draw Label (Size + Grade)
+                # Draw Label
                 label = f"{int(w_mm)}mm ({grade})"
                 x, y = box[1][0], box[1][1]
-                
-                # Smart label placement (ensure it stays on screen)
                 x = max(10, min(x, display_img.shape[1] - 100))
                 y = max(30, min(y, display_img.shape[0] - 10))
                 
-                # Label Background
                 (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
                 cv2.rectangle(display_img, (int(x), int(y) - h - 5), (int(x) + w, int(y) + 5), (0,0,0), -1)
                 cv2.putText(display_img, label, (int(x), int(y)), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-        # --- DISPLAY RESULTS ---
+        # --- DISPLAY ---
         col1, col2 = st.columns([1.5, 1])
         
         with col1:
@@ -152,19 +152,17 @@ def main():
                 c2.metric("Medium (55-64)", medium, f"{medium/total:.0%}")
                 c3.metric("Small (<55)", small, f"{small/total:.0%}")
                 
-                # Data Table
                 st.divider()
                 st.write("Detailed Data:")
                 st.dataframe(df.style.format({"Size": "{:.1f} mm"}))
                 
-                # CSV Download
                 csv = df.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Download Report (CSV)", csv, "onion_report.csv", "text/csv")
+                st.download_button("📥 Download CSV", csv, "onion_report.csv", "text/csv")
             
             elif not ref_found:
                 st.error("Reference cap not found.")
             else:
-                st.warning("No onions detected.")
+                st.warning("Reference found, but no onions detected. Try lowering 'Saturation Min'.")
 
 if __name__ == "__main__":
     main()
