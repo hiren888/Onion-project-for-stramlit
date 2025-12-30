@@ -93,7 +93,8 @@ def main():
                     
                     # Draw bounding box
                     box = cv2.boxPoints(cv2.minAreaRect(cnt))
-                    box = np.int0(box)
+                    # FIX: replaced np.int0(box) with box.astype(int)
+                    box = box.astype(int)
                     cv2.drawContours(display_img, [box], 0, (0, 255, 0), 2)
                     cv2.putText(display_img, f"{int(w_mm)}mm", (box[0][0], box[0][1]), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
