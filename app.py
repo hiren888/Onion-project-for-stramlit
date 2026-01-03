@@ -1,269 +1,240 @@
 import streamlit as st
+import cv2
+import numpy as np
+from PIL import Image
+from ultralytics import YOLO
+import pandas as pd
 
-# --- SAFETY BLOCK ---
-try:
-    import cv2
-    import numpy as np
-    import pandas as pd
-except ImportError as e:
-    st.error(f"CRITICAL ERROR: Library failed to load. {e}")
-    st.stop()
+# --- CONFIGURATION ---
+# USDA Onion Grading Standards (Diameter in mm)
+# Source: USDA Agricultural Marketing Service 
+GRADE_STANDARDS = {
+    "Small": (0, 50.8),      # < 2 inches
+    "Medium": (50.8, 76.2),  # 2 to 3 inches
+    "Large": (76.2, 95.0),   # 3 to 3.75 inches
+    "Colossal": (95.0, 1000) # > 3.75 inches
+}
 
-def get_min_axis_width(contour):
-    """Calculates the width (short side) of the object."""
-    rect = cv2.minAreaRect(contour)
-    (width, height) = rect[1]
-    return min(width, height)
+# ArUco Configuration
+ARUCO_DICT_TYPE = cv2.aruco.DICT_4X4_50
+# Default Marker Size (User can override in UI)
+DEFAULT_MARKER_SIZE_MM = 50.0 
 
-def get_contours(mask, min_area):
-    """Standard contour finding."""
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    # Sort largest to smallest
-    clean = sorted([c for c in contours if cv2.contourArea(c) > min_area], 
-                   key=cv2.contourArea, reverse=True)
-    return clean
-
-def watershed_robust(mask, sensitivity=0.4, blur_strength=5):
+@st.cache_resource
+def load_model():
     """
-    Advanced Watershed:
-    1. Blurs the distance map to merge 'skin noise' into one single peak.
-    2. Finds peaks.
-    3. Runs watershed.
+    Loads the YOLOv8 segmentation model.
+    The 'yolov8n-seg.pt' is the Nano model, optimized for CPU speed.
     """
-    # 1. Clean the mask (remove loose skin bridges)
-    kernel = np.ones((3,3), np.uint8)
-    opening = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
-    
-    # 2. Sure Background
-    sure_bg = cv2.dilate(opening, kernel, iterations=3)
-    
-    # 3. Distance Transform (The Height Map)
-    dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
-    
-    # --- CRITICAL FIX: BLUR THE PEAKS ---
-    # This smooths out flaky skin so we don't get 5 dots for 1 onion
-    if blur_strength > 0:
-        # Ensure kernel size is odd
-        k_size = (blur_strength * 2) + 1 
-        dist_transform = cv2.GaussianBlur(dist_transform, (k_size, k_size), 0)
-    
-    # Normalize for visualization
-    dist_vis = cv2.normalize(dist_transform, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
-    
-    # 4. Find Peaks (Sure Foreground)
-    ret, sure_fg = cv2.threshold(dist_transform, sensitivity * dist_transform.max(), 255, 0)
-    sure_fg = np.uint8(sure_fg)
-    
-    # 5. Watershed Markers
-    unknown = cv2.subtract(sure_bg, sure_fg)
-    ret, markers = cv2.connectedComponents(sure_fg)
-    markers = markers + 1
-    markers[unknown == 255] = 0
-    
-    mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    cv2.watershed(mask_bgr, markers)
-    
-    # 6. Extract Contours
-    final_contours = []
-    
-    # Get the centers for debugging
-    centers = []
-    peak_cnts, _ = cv2.findContours(sure_fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for pc in peak_cnts:
-        M = cv2.moments(pc)
-        if M["m00"] != 0:
-            centers.append((int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"])))
+    return YOLO('yolov8n-seg.pt')
 
-    # Process Watershed Results
-    for label in np.unique(markers):
-        if label <= 1: continue # Skip background and boundary
+def detect_aruco_and_get_ppm(image_bgr, marker_size_mm):
+    """
+    Detects ArUco marker to calculate Pixels-Per-Metric (PPM) ratio.
+    Uses sub-pixel corner refinement for high-precision metrology.
+    """
+    aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT_TYPE)
+    parameters = cv2.aruco.DetectorParameters()
+    # Critical for accuracy: Sub-pixel refinement
+    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    
+    detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
+    corners, ids, rejected = detector.detectMarkers(image_bgr)
+    
+    if ids is None:
+        return None, None, image_bgr
         
-        # Create a mask for this single object
-        obj_mask = np.zeros(mask.shape, dtype=np.uint8)
-        obj_mask[markers == label] = 255
+    # Visualization: Draw the detected marker
+    cv2.aruco.drawDetectedMarkers(image_bgr, corners, ids)
+    
+    # Use the first detected marker to calculate scale
+    # Corners structure: [top-left, top-right, bottom-right, bottom-left]
+    c = corners 
+    
+    # Calculate Euclidean distance of the top edge and left edge in pixels
+    width_px = np.linalg.norm(c - c)
+    height_px = np.linalg.norm(c - c)
+    
+    # Average the sides to account for slight perspective tilt
+    avg_size_px = (width_px + height_px) / 2.0
+    
+    # Calculate PPM (Pixels / mm)
+    ppm = avg_size_px / marker_size_mm
+    return ppm, ids, image_bgr
+
+def determine_grade(diameter_mm):
+    """Classifies diameter against USDA standards."""
+    for grade, (min_d, max_d) in GRADE_STANDARDS.items():
+        if min_d <= diameter_mm < max_d:
+            return grade
+    return "Oversized"
+
+def process_onions_yolo(model, image_bgr, ppm, conf_threshold):
+    """
+    Uses YOLOv8-seg to detect onions and measure them using the PPM ratio.
+    """
+    # 1. Run Inference
+    # Note: 'classes' argument can filter specific COCO classes (e.g., 46=banana, 49=orange)
+    # Ideally, use a custom model trained specifically on Onions.
+    # Here we accept all detections for demonstration or assume custom weights.
+    results = model(image_bgr, conf=conf_threshold) 
+    
+    processed_image = image_bgr.copy()
+    onion_data =
+    
+    # Access the first result object
+    result = results
+    
+    if result.masks is None:
+        return processed_image,
+
+    # 2. Iterate over detected instances
+    for i, mask_data in enumerate(result.masks.data):
+        # YOLOv8 masks are float tensors , convert to binary mask
+        mask_cpu = mask_data.cpu().numpy()
         
-        cnts, _ = cv2.findContours(obj_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if cnts:
-            # Convex Hull smooths the jagged watershed edges
-            hull = cv2.convexHull(cnts[0])
-            final_contours.append(hull)
+        # Resize mask to original image dimensions if necessary
+        # Ultralytics results.masks.data is typically lower res (160x160)
+        # We use results.masks.xy for exact polygon coordinates on original image
+        
+        # Get Polygon Coordinates (more accurate than resizing raster mask)
+        # result.masks.xy is a list of arrays, one per object
+        polygon = result.masks.xy[i].astype(np.int32)
+        
+        # Calculate Area using Contour
+        area_px = cv2.contourArea(polygon)
+        
+        # 3. Biometric Sizing: Equivalent Circle Diameter (ECD)
+        # This is robust against the "flaky skin" irregular shapes
+        diameter_px = 2 * np.sqrt(area_px / np.pi)
+        
+        # Convert to Millimeters
+        diameter_mm = diameter_px / ppm
+        grade = determine_grade(diameter_mm)
+        
+        # 4. Visualization
+        # Draw the accurate polygon contour
+        cv2.polylines(processed_image, [polygon], isClosed=True, color=(0, 255, 0), thickness=2)
+        
+        # Find center for labeling
+        M = cv2.moments(polygon)
+        if M["m00"]!= 0:
+            cX = int(M["m10"] / M["m00"])
+            cY = int(M["m01"] / M["m00"])
+        else:
+            cX, cY = polygon, polygon
             
-    return final_contours, centers, dist_vis
+        # Label with Grade and Size
+        label = f"{grade}\n{diameter_mm:.1f}mm"
+        # Draw background for text readability
+        (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(processed_image, (cX - 10, cY - 20), (cX + w, cY), (0,0,0), -1)
+        cv2.putText(processed_image, f"{diameter_mm:.1f}mm", (cX, cY - 5), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        onion_data.append({
+            "ID": i+1,
+            "Diameter (mm)": round(diameter_mm, 2),
+            "Grade": grade,
+            "Confidence": float(result.boxes.conf[i])
+        })
+        
+    return processed_image, onion_data
 
-def filter_overlapping_boxes(onion_data):
-    """
-    Removes 'Spiderwebs' (boxes inside other boxes).
-    """
-    if not onion_data: return []
-    
-    # Sort by size (largest first)
-    sorted_data = sorted(onion_data, key=lambda x: x['Size'], reverse=True)
-    kept_onions = []
-    
-    for i, onion in enumerate(sorted_data):
-        box = onion['Box']
-        is_inside = False
-        
-        center_x, center_y = np.mean(box, axis=0)
-        
-        # Check if this onion's center is inside any LARGER onion's box
-        for larger_onion in kept_onions:
-            l_box = larger_onion['Box']
-            # PointPolygonTest returns > 0 if point is inside
-            if cv2.pointPolygonTest(l_box, (center_x, center_y), False) > 0:
-                is_inside = True
-                break
-        
-        if not is_inside:
-            kept_onions.append(onion)
-            
-    return kept_onions
-
+# --- MAIN APP LOGIC ---
 def main():
-    st.set_page_config(page_title="Onion AI: Ultimate", layout="wide")
-    st.title("🧅 Onion AI: Ultimate Grader")
-    st.caption("Deep Logic: Vibrancy Detection + Gaussian Peak Smoothing + Overlap Removal")
-
-    # --- Sidebar ---
-    st.sidebar.header("1. Detection (The 'What')")
-    # Vibrancy is key for Rusty Trays
-    sat_min = st.sidebar.slider("Minimum Vibrancy (Sat)", 0, 255, 65, help="Increase to remove rusty tray. Decrease if onions disappear.")
+    st.set_page_config(page_title="AgriGrade AI: Onion Analytics", layout="wide")
     
-    st.sidebar.header("2. Separation (The 'How')")
-    peak_sens = st.sidebar.slider("Peak Sensitivity", 0.1, 0.9, 0.4, help="Controls Blue Dots. Higher = Splits clumps. Lower = Merges clumps.")
-    blur_peaks = st.sidebar.slider("Texture Smoothing", 0, 10, 4, help="CRITICAL: Increase this to fix 'Spiderwebs' (multiple boxes on one onion).")
+    st.title("🧅 AgriGrade AI: Precision Onion Grading")
+    st.markdown("""
+    **System Status:** Active | **Engine:** YOLOv8-seg + ArUco Metrology
     
-    st.sidebar.header("3. Physical Settings")
-    min_size_mm = st.sidebar.number_input("Min Onion Size (mm)", value=35.0)
-    ref_width_mm = st.sidebar.number_input("Real Cap Size (mm)", value=30.0)
-
-    debug_mode = st.sidebar.checkbox("Show Debug Layers", value=True)
-
-    # --- Upload ---
-    uploaded_file = st.file_uploader("Upload Image", type=['jpg', 'png', 'jpeg'])
-
-    if uploaded_file is not None:
+    This system replaces legacy watershed segmentation with Deep Learning Instance Segmentation 
+    to resolve texture noise issues. It requires a **4x4 ArUco Marker** for absolute sizing.
+    """)
+    
+    # Sidebar Configuration
+    st.sidebar.header("Calibration Settings")
+    marker_size = st.sidebar.number_input("ArUco Marker Size (mm)", value=DEFAULT_MARKER_SIZE_MM)
+    conf_threshold = st.sidebar.slider("AI Confidence Threshold", 0.0, 1.0, 0.25, 
+                                       help="Lower value detects more objects but may increase false positives.")
+    
+    # File Uploader
+    uploaded_file = st.file_uploader("Upload Grading Batch (Top-Down View)", type=['jpg', 'png', 'jpeg'])
+    
+    if uploaded_file:
+        # Load and Decode Image
         file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-        img = cv2.imdecode(file_bytes, 1)
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        display_img = img.copy()
-
-        # --- STEP 1: MASKS ---
-        # Green Cap (Standard Range)
-        mask_cap = cv2.inRange(hsv, np.array([35, 50, 50]), np.array([85, 255, 255]))
+        img_bgr = cv2.imdecode(file_bytes, 1)
         
-        # Onion (Vibrancy Logic - Ignores Hue, focuses on Saturation)
-        # We assume onions are 'Colorful' (Sat > X) and 'Not Dark' (Val > 40)
-        # We cap Hue at 179 to catch Red/Purple/Orange
-        mask_onion = cv2.inRange(hsv, np.array([0, sat_min, 40]), np.array([179, 255, 255]))
+        # Layout: Two Columns
+        col1, col2 = st.columns(2)
         
-        # Clean noise
-        kernel = np.ones((3, 3), np.uint8)
-        mask_onion = cv2.morphologyEx(mask_onion, cv2.MORPH_OPEN, kernel, iterations=1)
-        mask_onion = cv2.morphologyEx(mask_onion, cv2.MORPH_CLOSE, kernel, iterations=4) # Strong close to solidify skin
-
-        # --- STEP 2: WATERSHED ---
-        raw_contours, centers, dist_map = watershed_robust(mask_onion, sensitivity=peak_sens, blur_strength=blur_peaks)
-
-        # --- STEP 3: REFERENCE ---
-        cnts_cap = get_contours(mask_cap, 200)
-        scale = 0
-        ref_found = False
-
-        if cnts_cap:
-            ref_contour = cnts_cap[0]
-            ref_px = get_min_axis_width(ref_contour)
-            if ref_px > 0:
-                scale = (ref_px / ref_width_mm)
-                ref_found = True
-                box = cv2.boxPoints(cv2.minAreaRect(ref_contour))
-                box = box.astype(int)
-                cv2.drawContours(display_img, [box], 0, (255, 0, 0), 3)
-                cv2.putText(display_img, "REF", (box[0][0], box[0][1]), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
-
-        # --- STEP 4: MEASURE & FILTER ---
-        pre_filter_data = []
-        if ref_found:
-            for cnt in raw_contours:
-                if cv2.contourArea(cnt) < 500: continue
-                
-                w_px = get_min_axis_width(cnt)
-                w_mm = w_px / scale
-                
-                if w_mm < min_size_mm: continue 
-
-                # Store data for overlap filtering
-                rect = cv2.minAreaRect(cnt)
-                box = cv2.boxPoints(rect)
-                box = box.astype(int)
-                
-                pre_filter_data.append({
-                    "Size": w_mm,
-                    "Box": box,
-                    "Contour": cnt
-                })
-
-            # --- STEP 5: REMOVE OVERLAPPING BOXES ---
-            final_onions = filter_overlapping_boxes(pre_filter_data)
-            
-            # Draw Final Results
-            for onion in final_onions:
-                w_mm = onion['Size']
-                box = onion['Box']
-                
-                if w_mm >= 65: grade = "L"
-                elif w_mm >= 55: grade = "M"
-                else: grade = "S"
-                
-                # Draw Green Box
-                cv2.drawContours(display_img, [box], 0, (0, 255, 0), 2)
-                
-                # Label
-                label = f"{int(w_mm)}"
-                # Ensure label is on screen
-                x, y = box[1][0], box[1][1]
-                x = max(20, min(x, display_img.shape[1]-50))
-                y = max(20, min(y, display_img.shape[0]-20))
-                
-                cv2.putText(display_img, label, (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-        # --- DISPLAY ---
-        col1, col2 = st.columns([2, 1])
         with col1:
-            st.image(display_img, channels="BGR", use_column_width=True, caption="Final Grading")
+            st.subheader("1. Input & Calibration")
+            # Display original (convert BGR to RGB for Streamlit)
+            st.image(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), caption="Raw Input", use_container_width=True)
             
-            if debug_mode:
-                st.write("### 🔍 Debug Views")
-                c_d1, c_d2 = st.columns(2)
-                c_d1.image(mask_onion, caption="1. Vibrancy Mask (White=Onion)", channels='GRAY')
-                # Visualize the smoothed peaks
-                c_d2.image(dist_map, caption="2. Smoothed Peaks (White=Centers)", clamp=True)
-                st.caption("Tip: If the 'Smoothed Peaks' image looks grainy, increase 'Texture Smoothing'.")
-
+            # Perform Calibration
+            with st.status("Calibrating Geometry...", expanded=True) as status:
+                ppm, ids, debug_img = detect_aruco_and_get_ppm(img_bgr.copy(), marker_size)
+                
+                if ppm:
+                    st.write(f"✅ **Marker Detected:** ID {ids.flatten()}")
+                    st.write(f"📏 **Scale Factor:** {ppm:.2f} pixels/mm")
+                    status.update(label="Calibration Complete", state="complete")
+                else:
+                    st.error("❌ No ArUco marker detected.")
+                    st.warning("System will default to pixel measurements (uncalibrated).")
+                    ppm = 1.0 # Fallback to prevent crash
+                    status.update(label="Calibration Failed", state="error")
+        
         with col2:
-            st.subheader("📊 Report")
-            if ref_found and final_onions:
-                df = pd.DataFrame([{"Size": o['Size']} for o in final_onions])
-                # Add grades for the CSV
-                df['Grade'] = df['Size'].apply(lambda x: 'L' if x>=65 else ('M' if x>=55 else 'S'))
+            st.subheader("2. AI Segmentation & Grading")
+            
+            if ppm == 1.0:
+                st.warning("⚠️ Displaying results in Pixels (Uncalibrated)")
+            
+            with st.spinner("Running YOLOv8 Inference..."):
+                model = load_model()
+                processed_img, data = process_onions_yolo(model, img_bgr.copy(), ppm, conf_threshold)
                 
-                total = len(df)
-                large = len(df[df['Grade'] == 'L'])
-                medium = len(df[df['Grade'] == 'M'])
-                small = len(df[df['Grade'] == 'S'])
+                # Display Result
+                st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), 
+                         caption="Segmented & Graded Output", use_container_width=True)
+        
+        # Data Reporting Section
+        st.divider()
+        st.subheader("3. Batch Analytics")
+        
+        if data:
+            df = pd.DataFrame(data)
+            
+            # Summary Metrics
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Count", len(df))
+            m2.metric("Average Diameter", f"{df.mean():.1f} mm")
+            m3.metric("Min Diameter", f"{df.min():.1f} mm")
+            m4.metric("Max Diameter", f"{df.max():.1f} mm")
+            
+            # Grade Distribution Table
+            grade_counts = df['Grade'].value_counts().reset_index()
+            grade_counts.columns = ['Grade', 'Count']
+            
+            c1, c2 = st.columns()
+            with c1:
+                st.write("#### Grade Distribution")
+                st.dataframe(grade_counts, hide_index=True, use_container_width=True)
+            with c2:
+                st.write("#### Detailed Log")
+                st.dataframe(df, use_container_width=True)
                 
-                st.metric("Total Onions", total)
-                c1, c2, c3 = st.columns(3)
-                c1.metric("L (>65)", large, f"{large/total:.0%}")
-                c2.metric("M (55-64)", medium, f"{medium/total:.0%}")
-                c3.metric("S (<55)", small, f"{small/total:.0%}")
-                
-                csv = df.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Download CSV", csv, "onions.csv", "text/csv")
-            elif not ref_found:
-                st.error("Reference Cap NOT found.")
-            else:
-                st.warning("No onions detected.")
+            # CSV Download
+            csv = df.to_csv(index=False).encode('utf-8')
+            st.download_button("Download Batch Report", csv, "onion_grading.csv", "text/csv")
+            
+        else:
+            st.info("No onions detected. Adjust confidence threshold or check image lighting.")
 
 if __name__ == "__main__":
     main()
