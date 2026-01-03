@@ -82,16 +82,18 @@ def process_onions_yolo(model, image_bgr, ppm, conf_threshold):
     results = model(image_bgr, conf=conf_threshold) 
     
     processed_image = image_bgr.copy()
-    onion_data =
+    onion_data =  # Initialize empty list to avoid SyntaxError
     
     # Access the first result object
     # model() returns a list of Results objects, we take the first one
     if not results:
+        # Return empty list if no results found to match unpacking in main()
         return processed_image,
 
     result = results
     
     if result.masks is None:
+        # Return empty list if no masks found to match unpacking in main()
         return processed_image,
 
     # 2. Iterate over detected instances
@@ -122,7 +124,10 @@ def process_onions_yolo(model, image_bgr, ppm, conf_threshold):
             cY = int(M["m01"] / M["m00"])
         else:
             # Fallback if moment is zero (rare)
-            cX, cY = polygon, polygon[1]
+            if len(polygon) > 0:
+                cX, cY = polygon, polygon[1]
+            else:
+                continue # Skip if polygon is invalid
             
         # Label with Grade and Size
         label = f"{grade}\n{diameter_mm:.1f}mm"
