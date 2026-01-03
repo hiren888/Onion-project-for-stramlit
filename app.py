@@ -2,37 +2,59 @@ import streamlit as st
 import cv2
 import numpy as np
 from PIL import Image
-from ultralytics import YOLO
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 from datetime import datetime
 
+# Try importing optional dependencies
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+
 # --- CONFIGURATION ---
-# USDA Onion Grading Standards (Diameter in mm)
 GRADE_STANDARDS = {
-    "Small": (0, 50.8),      # < 2 inches
-    "Medium": (50.8, 76.2),   # 2 to 3 inches
-    "Large": (76.2, 95.0),    # 3 to 3.75 inches
-    "Colossal": (95.0, 1000)  # > 3.75 inches
+    "Small": (0, 50.8),
+    "Medium": (50.8, 76.2),
+    "Large": (76.2, 95.0),
+    "Colossal": (95.0, 1000)
 }
 
-# Grade color coding for visualization
 GRADE_COLORS = {
-    "Small": (255, 200, 0),      # Yellow
-    "Medium": (0, 255, 150),     # Green
-    "Large": (0, 150, 255),      # Blue
-    "Colossal": (255, 0, 255),   # Magenta
-    "Oversized": (255, 0, 0)     # Red
+    "Small": (255, 200, 0),
+    "Medium": (0, 255, 150),
+    "Large": (0, 150, 255),
+    "Colossal": (255, 0, 255),
+    "Oversized": (255, 0, 0)
 }
 
-# ArUco Configuration
 ARUCO_DICT_TYPE = cv2.aruco.DICT_4X4_50
 DEFAULT_MARKER_SIZE_MM = 50.0
 
+def check_dependencies():
+    """Check and display dependency status."""
+    missing = []
+    
+    if not YOLO_AVAILABLE:
+        missing.append("ultralytics")
+    if not PLOTLY_AVAILABLE:
+        missing.append("plotly")
+    
+    return missing
+
 @st.cache_resource
 def load_model():
-    """Loads YOLOv8 segmentation model with error handling."""
+    """Loads YOLOv8 segmentation model."""
+    if not YOLO_AVAILABLE:
+        return None, "ultralytics package not installed"
+    
     try:
         model = YOLO('yolov8n-seg.pt')
         return model, None
@@ -40,10 +62,7 @@ def load_model():
         return None, str(e)
 
 def detect_aruco_and_get_ppm(image_bgr, marker_size_mm):
-    """
-    Detects ArUco marker and calculates Pixels-Per-Metric (PPM) ratio.
-    Returns: (ppm, marker_ids, annotated_image, corner_coordinates)
-    """
+    """Detects ArUco marker and calculates PPM ratio."""
     try:
         aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT_TYPE)
         parameters = cv2.aruco.DetectorParameters()
@@ -55,11 +74,9 @@ def detect_aruco_and_get_ppm(image_bgr, marker_size_mm):
         if ids is None or len(corners) == 0:
             return None, None, image_bgr, None
         
-        # Annotate image
         annotated = image_bgr.copy()
         cv2.aruco.drawDetectedMarkers(annotated, corners, ids)
         
-        # Calculate PPM from first marker
         c = corners[0][0]
         width_px = np.linalg.norm(c[0] - c[1])
         height_px = np.linalg.norm(c[0] - c[3])
@@ -80,16 +97,10 @@ def determine_grade(diameter_mm):
     return "Oversized"
 
 def calculate_ellipse_metrics(contour):
-    """
-    Calculates both circular and elliptical metrics for shape analysis.
-    Returns: (ecd, major_axis, minor_axis, eccentricity)
-    """
+    """Calculates shape metrics."""
     area = cv2.contourArea(contour)
-    
-    # Equivalent Circle Diameter
     ecd = 2 * np.sqrt(area / np.pi)
     
-    # Fit ellipse if contour has enough points
     if len(contour) >= 5:
         try:
             ellipse = cv2.fitEllipse(contour)
@@ -104,11 +115,8 @@ def calculate_ellipse_metrics(contour):
     return ecd, ecd, ecd, 0.0
 
 def process_onions_yolo(model, image_bgr, ppm, conf_threshold, show_advanced=False):
-    """
-    Detects and measures onions using YOLOv8 instance segmentation.
-    """
+    """Detects and measures onions using YOLOv8."""
     try:
-        # Run inference
         results = model(image_bgr, conf=conf_threshold, verbose=False)
         
         if not results or results[0].masks is None:
@@ -118,18 +126,15 @@ def process_onions_yolo(model, image_bgr, ppm, conf_threshold, show_advanced=Fal
         processed_image = image_bgr.copy()
         onion_data = []
         
-        # Process each detected instance
         for i, mask_data in enumerate(result.masks.data):
             polygon = result.masks.xy[i].astype(np.int32)
             
             if len(polygon) == 0:
                 continue
             
-            # Calculate metrics
             area_px = cv2.contourArea(polygon)
             ecd_px, major_px, minor_px, eccent = calculate_ellipse_metrics(polygon)
             
-            # Convert to millimeters
             diameter_mm = ecd_px / ppm
             major_mm = major_px / ppm
             minor_mm = minor_px / ppm
@@ -138,10 +143,8 @@ def process_onions_yolo(model, image_bgr, ppm, conf_threshold, show_advanced=Fal
             grade = determine_grade(diameter_mm)
             color = GRADE_COLORS.get(grade, (255, 255, 255))
             
-            # Draw contour with grade-specific color
             cv2.polylines(processed_image, [polygon], True, color, 3)
             
-            # Calculate centroid
             M = cv2.moments(polygon)
             if M["m00"] != 0:
                 cX = int(M["m10"] / M["m00"])
@@ -149,13 +152,11 @@ def process_onions_yolo(model, image_bgr, ppm, conf_threshold, show_advanced=Fal
             else:
                 cX, cY = polygon[0][0], polygon[0][1]
             
-            # Enhanced labeling
             if show_advanced:
                 label = f"{grade}\n{diameter_mm:.1f}mm\ne={eccent:.2f}"
             else:
                 label = f"{grade}\n{diameter_mm:.1f}mm"
             
-            # Draw text background
             y_offset = 0
             for line in label.split('\n'):
                 (w, h), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
@@ -168,10 +169,8 @@ def process_onions_yolo(model, image_bgr, ppm, conf_threshold, show_advanced=Fal
                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 y_offset += h + 5
             
-            # Circle centroid
             cv2.circle(processed_image, (cX, cY), 5, color, -1)
             
-            # Store data
             onion_data.append({
                 "ID": i + 1,
                 "Diameter (mm)": round(diameter_mm, 2),
@@ -191,8 +190,9 @@ def process_onions_yolo(model, image_bgr, ppm, conf_threshold, show_advanced=Fal
 
 def create_visualizations(df):
     """Creates interactive Plotly visualizations."""
+    if not PLOTLY_AVAILABLE:
+        return None, None, None
     
-    # Grade distribution pie chart
     grade_counts = df['Grade'].value_counts()
     fig_pie = px.pie(
         values=grade_counts.values,
@@ -201,7 +201,6 @@ def create_visualizations(df):
         color_discrete_sequence=px.colors.qualitative.Set2
     )
     
-    # Diameter histogram
     fig_hist = px.histogram(
         df,
         x="Diameter (mm)",
@@ -211,7 +210,6 @@ def create_visualizations(df):
         labels={"Diameter (mm)": "Diameter (mm)", "count": "Frequency"}
     )
     
-    # Scatter: Diameter vs Eccentricity
     fig_scatter = px.scatter(
         df,
         x="Diameter (mm)",
@@ -224,12 +222,75 @@ def create_visualizations(df):
     
     return fig_pie, fig_hist, fig_scatter
 
+def show_dependency_warning(missing_deps):
+    """Display installation instructions for missing dependencies."""
+    st.error("⚠️ **Missing Required Dependencies**")
+    
+    st.markdown(f"""
+    The following packages are not installed: **{', '.join(missing_deps)}**
+    
+    ### 📦 Installation Instructions
+    
+    **Option 1: Using pip**
+    ```bash
+    pip install ultralytics plotly opencv-python
+    ```
+    
+    **Option 2: Using requirements.txt**
+    
+    Create a `requirements.txt` file with:
+    ```
+    streamlit
+    opencv-python-headless
+    numpy
+    pandas
+    pillow
+    ultralytics
+    plotly
+    ```
+    
+    Then run:
+    ```bash
+    pip install -r requirements.txt
+    ```
+    
+    **For Streamlit Cloud:**
+    
+    1. Create a `requirements.txt` file in your repository root
+    2. Add the packages listed above
+    3. Commit and push to GitHub
+    4. Streamlit Cloud will automatically install them
+    
+    ### 🔧 Package Details
+    
+    - **ultralytics**: YOLOv8 object detection and segmentation
+    - **plotly**: Interactive data visualizations
+    - **opencv-python**: Computer vision operations
+    """)
+    
+    with st.expander("📄 View Complete requirements.txt"):
+        st.code("""streamlit>=1.28.0
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+pandas>=2.0.0
+pillow>=10.0.0
+ultralytics>=8.0.0
+plotly>=5.17.0""", language="text")
+
 def main():
     st.set_page_config(
         page_title="AgriGrade AI: Onion Analytics",
         layout="wide",
         initial_sidebar_state="expanded"
     )
+    
+    # Check dependencies
+    missing_deps = check_dependencies()
+    
+    if missing_deps:
+        st.title("🧅 AgriGrade AI: Precision Onion Grading System")
+        show_dependency_warning(missing_deps)
+        return
     
     # Header
     st.title("🧅 AgriGrade AI: Precision Onion Grading System")
@@ -282,7 +343,6 @@ def main():
     )
     
     if uploaded_file:
-        # Load image
         file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
         img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
         
@@ -290,7 +350,6 @@ def main():
             st.error("Failed to decode image. Please upload a valid image file.")
             return
         
-        # Layout
         col1, col2 = st.columns([1, 1])
         
         with col1:
@@ -301,7 +360,6 @@ def main():
                 use_container_width=True
             )
             
-            # Calibration
             with st.status("🎯 Performing Calibration...", expanded=True) as status:
                 ppm, ids, debug_img, corners = detect_aruco_and_get_ppm(
                     img_bgr.copy(),
@@ -322,11 +380,9 @@ def main():
         with col2:
             st.subheader("🤖 AI Segmentation & Grading")
             
-            # Load model
             model, error = load_model()
             if error:
                 st.error(f"Model loading failed: {error}")
-                st.info("Please ensure 'yolov8n-seg.pt' is available or will be downloaded.")
                 return
             
             with st.spinner("🔍 Running YOLOv8 Inference..."):
@@ -344,14 +400,12 @@ def main():
                 use_container_width=True
             )
         
-        # Analytics Section
         if data:
             st.divider()
             st.subheader("📊 Batch Analytics Dashboard")
             
             df = pd.DataFrame(data)
             
-            # Summary metrics
             metric_cols = st.columns(5)
             metric_cols[0].metric("🧅 Total Count", len(df))
             metric_cols[1].metric("📏 Avg Diameter", f"{df['Diameter (mm)'].mean():.1f} mm")
@@ -361,22 +415,26 @@ def main():
             
             st.divider()
             
-            # Visualizations
             tab1, tab2, tab3 = st.tabs(["📈 Charts", "📋 Data Table", "📥 Export"])
             
             with tab1:
-                fig_pie, fig_hist, fig_scatter = create_visualizations(df)
-                
-                chart_col1, chart_col2 = st.columns(2)
-                with chart_col1:
-                    st.plotly_chart(fig_pie, use_container_width=True)
-                with chart_col2:
-                    st.plotly_chart(fig_hist, use_container_width=True)
-                
-                st.plotly_chart(fig_scatter, use_container_width=True)
+                if PLOTLY_AVAILABLE:
+                    fig_pie, fig_hist, fig_scatter = create_visualizations(df)
+                    
+                    chart_col1, chart_col2 = st.columns(2)
+                    with chart_col1:
+                        st.plotly_chart(fig_pie, use_container_width=True)
+                    with chart_col2:
+                        st.plotly_chart(fig_hist, use_container_width=True)
+                    
+                    st.plotly_chart(fig_scatter, use_container_width=True)
+                else:
+                    st.warning("Install plotly for interactive charts: `pip install plotly`")
+                    
+                    # Fallback: Simple bar chart
+                    st.bar_chart(df['Grade'].value_counts())
             
             with tab2:
-                # Grade distribution
                 st.write("#### 📊 Grade Distribution Summary")
                 grade_summary = df.groupby('Grade').agg({
                     'ID': 'count',
@@ -392,7 +450,6 @@ def main():
             with tab3:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 
-                # CSV Export
                 csv = df.to_csv(index=False).encode('utf-8')
                 st.download_button(
                     "📥 Download CSV Report",
@@ -402,7 +459,6 @@ def main():
                     use_container_width=True
                 )
                 
-                # Summary Report
                 summary_text = f"""
 AGRIGRADE AI - BATCH REPORT
 Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
@@ -433,7 +489,6 @@ QUALITY METRICS
             st.info("🔍 No onions detected. Try adjusting the confidence threshold or check image quality.")
     
     else:
-        # Instructions when no file uploaded
         st.info("👆 Upload an image to begin automated grading")
         
         with st.expander("📖 Quick Start Guide"):
