@@ -8,89 +8,104 @@ except ImportError as e:
     st.error(f"CRITICAL ERROR: Library failed to load. {e}")
     st.stop()
 
-def get_contours(mask, min_area):
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    clean_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > min_area]
-    clean_contours = sorted(clean_contours, key=cv2.contourArea, reverse=True)
-    return clean_contours
-
 def get_min_axis_width(contour):
     rect = cv2.minAreaRect(contour)
     (width, height) = rect[1]
     return min(width, height)
 
-def watershed_separation(mask, min_distance_sensitivity=0.5):
+def get_contours(mask, min_area):
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    clean = [c for c in contours if cv2.contourArea(c) > min_area]
+    return sorted(clean, key=cv2.contourArea, reverse=True)
+
+def watershed_separation(mask, sensitivity=0.4, erosion_iter=0):
     """
-    Uses the Watershed algorithm to separate touching objects.
-    min_distance_sensitivity: 0.0 to 1.0. Higher = splits more aggressively.
+    Separates touching objects using Distance Transform + Watershed.
     """
-    # 1. Clean small noise
+    # 1. CLEANUP (Clump Breaking)
+    # Erode the mask to snap thin connections (onion skins)
     kernel = np.ones((3,3), np.uint8)
+    if erosion_iter > 0:
+        mask = cv2.erode(mask, kernel, iterations=erosion_iter)
+    
+    # Clean noise (Opening)
     opening = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
     
-    # 2. Identify the "Sure Background" (dilate the object)
+    # 2. FIND SURE BACKGROUND
     sure_bg = cv2.dilate(opening, kernel, iterations=3)
     
-    # 3. Identify the "Sure Foreground" (Distance Transform)
-    # This finds the "peaks" or centers of the onions
+    # 3. FIND SURE FOREGROUND (Peaks)
     dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
     
-    # Threshold to get the peaks. 
-    # sensitivity controls how "tall" a peak must be to count as a separate onion.
-    ret, sure_fg = cv2.threshold(dist_transform, min_distance_sensitivity * dist_transform.max(), 255, 0)
+    # Normalize for visualization
+    dist_vis = cv2.normalize(dist_transform, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+    
+    # Threshold to find peaks
+    ret, sure_fg = cv2.threshold(dist_transform, sensitivity * dist_transform.max(), 255, 0)
     sure_fg = np.uint8(sure_fg)
     
-    # 4. Identify the "Unknown Region" (The border where they touch)
+    # 4. WATERSHED
     unknown = cv2.subtract(sure_bg, sure_fg)
-    
-    # 5. Create Markers
     ret, markers = cv2.connectedComponents(sure_fg)
-    markers = markers + 1 # Add 1 so background is 1, not 0
-    markers[unknown == 255] = 0 # Mark the unknown region as 0
+    markers = markers + 1
+    markers[unknown == 255] = 0
     
-    # 6. Run Watershed
-    # We need a 3-channel image for watershed, so we convert mask to BGR
     mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
     cv2.watershed(mask_bgr, markers)
     
-    # 7. Extract Contours from Markers
+    # 5. EXTRACT CONTOURS
     final_contours = []
-    # Loop through unique markers (skipping 0=boundary and 1=background)
+    centers = [] # To store the peaks for debugging
+    
+    # Get centers from sure_fg
+    peak_contours, _ = cv2.findContours(sure_fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for pc in peak_contours:
+        M = cv2.moments(pc)
+        if M["m00"] != 0:
+            cX = int(M["m10"] / M["m00"])
+            cY = int(M["m01"] / M["m00"])
+            centers.append((cX, cY))
+
     for label in np.unique(markers):
         if label <= 1: continue
         
-        # Create a mask for just this object
+        # Create mask for this single object
         obj_mask = np.zeros(mask.shape, dtype=np.uint8)
         obj_mask[markers == label] = 255
         
-        # Find contour of this separated object
         cnts, _ = cv2.findContours(obj_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if cnts:
-            final_contours.append(cnts[0])
+            # Take the convex hull to smooth out jagged watershed edges
+            hull = cv2.convexHull(cnts[0])
+            final_contours.append(hull)
             
-    return final_contours, markers
+    return final_contours, centers, dist_vis
 
 def main():
-    st.set_page_config(page_title="Onion AI: Watershed", layout="wide")
-    st.title("🧅 Onion AI: Precision Separation")
-    st.caption("Using Watershed Algorithm to split touching onions without shrinking them.")
+    st.set_page_config(page_title="Onion AI: Clump Breaker", layout="wide")
+    st.title("🧅 Onion AI: Clump Breaker")
+    st.caption("Use the 'Blue Dots' to tune separation.")
 
     # --- Sidebar ---
-    st.sidebar.header("1. Separation Engine")
-    use_watershed = st.sidebar.checkbox("Enable Watershed Separation", value=True)
-    # NEW SLIDER: The most important control for touching onions
-    peak_sensitivity = st.sidebar.slider("Separation Sensitivity", 0.1, 0.9, 0.4, step=0.05, 
-                                       help="Lower (0.2) = Merges onions. Higher (0.6) = Splits onions aggressively.")
+    st.sidebar.header("1. Separation Tuning")
     
-    st.sidebar.header("2. Rust/Vibrancy Filters")
-    sat_min = st.sidebar.slider("Min Vibrancy (Sat)", 0, 255, 65, help="Increase to remove rusty tray.")
+    # SLIDER 1: PEAK SENSITIVITY
+    peak_sens = st.sidebar.slider("1. Peak Sensitivity", 0.1, 0.9, 0.4, step=0.05, 
+                                help="Control the Blue Dots.\nToo many dots on one onion? Slide LEFT.\nOne dot for two onions? Slide RIGHT.")
+    
+    # SLIDER 2: CLUMP BREAKER
+    clump_iter = st.sidebar.slider("2. Clump Breaker (Erosion)", 0, 5, 2, 
+                                 help="Cuts the thin skin bridges between onions.\nIncrease if onions are stuck together.")
+
+    st.sidebar.header("2. Detection (Rust/Color)")
+    sat_min = st.sidebar.slider("Min Vibrancy (Sat)", 0, 255, 60, help="Increase to remove rusty tray background.")
     val_min = st.sidebar.slider("Min Brightness", 0, 255, 50)
     
     st.sidebar.header("3. Physical Settings")
     min_size_mm = st.sidebar.number_input("Min Onion Size (mm)", value=35.0)
     ref_width_mm = st.sidebar.number_input("Real Cap Size (mm)", value=30.0)
 
-    debug_mode = st.sidebar.checkbox("Show Debug Maps", value=True)
+    debug_mode = st.sidebar.checkbox("Show Debug Layers", value=True)
 
     # --- Upload ---
     uploaded_file = st.file_uploader("Upload Image", type=['jpg', 'png', 'jpeg'])
@@ -102,33 +117,16 @@ def main():
         display_img = img.copy()
 
         # --- MASKS ---
-        # 1. Cap
+        # Cap
         mask_cap = cv2.inRange(hsv, np.array([35, 60, 60]), np.array([85, 255, 255]))
         
-        # 2. Onion (Vibrancy Logic)
+        # Onion (Vibrancy)
         mask_onion = cv2.inRange(hsv, np.array([0, sat_min, val_min]), np.array([179, 255, 255]))
         kernel = np.ones((3, 3), np.uint8)
-        mask_onion = cv2.morphologyEx(mask_onion, cv2.MORPH_OPEN, kernel)
-        mask_onion = cv2.morphologyEx(mask_onion, cv2.MORPH_CLOSE, kernel)
+        mask_onion = cv2.morphologyEx(mask_onion, cv2.MORPH_CLOSE, kernel, iterations=2) # Fill holes first
 
-        # --- SEPARATION LOGIC ---
-        markers_vis = None
-        
-        if use_watershed:
-            # Run the advanced separation
-            cnts_onion, markers = watershed_separation(mask_onion, peak_sensitivity)
-            
-            # Create a colorful debug image for the markers
-            if debug_mode:
-                markers_vis = np.zeros_like(img)
-                # Color code the markers
-                for label in np.unique(markers):
-                    if label <= 1: continue
-                    color = np.random.randint(0, 255, size=3).tolist()
-                    markers_vis[markers == label] = color
-        else:
-            # Fallback to standard
-            cnts_onion = get_contours(mask_onion, 200)
+        # --- SEPARATION ---
+        cnts_onion, centers, dist_map = watershed_separation(mask_onion, peak_sens, clump_iter)
 
         # --- MEASURE ---
         cnts_cap = get_contours(mask_cap, 200)
@@ -149,10 +147,10 @@ def main():
         onion_data = []
         if ref_found:
             for cnt in cnts_onion:
-                # Filter noise
                 if cv2.contourArea(cnt) < 500: continue
                 
-                w_px = get_min_axis_width(cnt)
+                # Compensate for Clump Breaker shrinking
+                w_px = get_min_axis_width(cnt) + (clump_iter * 2) 
                 w_mm = w_px / scale
                 
                 if w_mm < min_size_mm: continue 
@@ -168,17 +166,22 @@ def main():
                 box = cv2.boxPoints(rect)
                 box = box.astype(int)
                 cv2.drawContours(display_img, [box], 0, (0, 255, 0), 2)
-                cv2.putText(display_img, f"{int(w_mm)}", (box[0][0], box[0][1]), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                # Label
+                cv2.putText(display_img, f"{int(w_mm)}", (box[0][0], box[0][1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            # Draw "Centers" (Blue Dots) for tuning
+            if debug_mode:
+                for (cx, cy) in centers:
+                    cv2.circle(display_img, (cx, cy), 5, (255, 0, 0), -1) # Blue Dot
+                    cv2.circle(display_img, (cx, cy), 2, (255, 255, 255), -1) # White center
 
         # --- DISPLAY ---
-        col1, col2 = st.columns([1.5, 1])
+        col1, col2 = st.columns([2, 1])
         with col1:
-            st.image(display_img, channels="BGR", use_column_width=True)
+            st.image(display_img, channels="BGR", use_column_width=True, caption="Blue Dots = Onion Centers")
             if debug_mode:
-                if markers_vis is not None:
-                    st.image(markers_vis, caption="Watershed Segments (Each color is a separate onion)", use_column_width=True)
-                else:
-                    st.image(mask_onion, caption="Binary Mask", channels='GRAY')
+                st.image(dist_map, caption="Separation Map (Brighter = More likely to be center)", clamp=True)
 
         with col2:
             st.subheader("📊 Report")
