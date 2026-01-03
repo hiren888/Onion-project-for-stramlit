@@ -4,65 +4,73 @@ import numpy as np
 from PIL import Image
 from ultralytics import YOLO
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime
 
 # --- CONFIGURATION ---
 # USDA Onion Grading Standards (Diameter in mm)
-# Source: USDA Agricultural Marketing Service 
 GRADE_STANDARDS = {
     "Small": (0, 50.8),      # < 2 inches
-    "Medium": (50.8, 76.2),  # 2 to 3 inches
-    "Large": (76.2, 95.0),   # 3 to 3.75 inches
-    "Colossal": (95.0, 1000) # > 3.75 inches
+    "Medium": (50.8, 76.2),   # 2 to 3 inches
+    "Large": (76.2, 95.0),    # 3 to 3.75 inches
+    "Colossal": (95.0, 1000)  # > 3.75 inches
+}
+
+# Grade color coding for visualization
+GRADE_COLORS = {
+    "Small": (255, 200, 0),      # Yellow
+    "Medium": (0, 255, 150),     # Green
+    "Large": (0, 150, 255),      # Blue
+    "Colossal": (255, 0, 255),   # Magenta
+    "Oversized": (255, 0, 0)     # Red
 }
 
 # ArUco Configuration
 ARUCO_DICT_TYPE = cv2.aruco.DICT_4X4_50
-# Default Marker Size (User can override in UI)
-DEFAULT_MARKER_SIZE_MM = 50.0 
+DEFAULT_MARKER_SIZE_MM = 50.0
 
 @st.cache_resource
 def load_model():
-    """
-    Loads the YOLOv8 segmentation model.
-    The 'yolov8n-seg.pt' is the Nano model, optimized for CPU speed.
-    """
-    return YOLO('yolov8n-seg.pt')
+    """Loads YOLOv8 segmentation model with error handling."""
+    try:
+        model = YOLO('yolov8n-seg.pt')
+        return model, None
+    except Exception as e:
+        return None, str(e)
 
 def detect_aruco_and_get_ppm(image_bgr, marker_size_mm):
     """
-    Detects ArUco marker to calculate Pixels-Per-Metric (PPM) ratio.
-    Uses sub-pixel corner refinement for high-precision metrology.
+    Detects ArUco marker and calculates Pixels-Per-Metric (PPM) ratio.
+    Returns: (ppm, marker_ids, annotated_image, corner_coordinates)
     """
-    aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT_TYPE)
-    parameters = cv2.aruco.DetectorParameters()
-    # Critical for accuracy: Sub-pixel refinement
-    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-    
-    # Updated for OpenCV 4.8+: Use ArucoDetector class
-    detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
-    corners, ids, rejected = detector.detectMarkers(image_bgr)
-    
-    if ids is None:
-        return None, None, image_bgr
+    try:
+        aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT_TYPE)
+        parameters = cv2.aruco.DetectorParameters()
+        parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         
-    # Visualization: Draw the detected marker
-    cv2.aruco.drawDetectedMarkers(image_bgr, corners, ids)
-    
-    # Use the first detected marker to calculate scale
-    # Corners structure: [top-left, top-right, bottom-right, bottom-left]
-    # We take the first marker found (index 0)
-    c = corners
-    
-    # Calculate Euclidean distance of the top edge and left edge in pixels
-    width_px = np.linalg.norm(c - c[1])
-    height_px = np.linalg.norm(c - c[2])
-    
-    # Average the sides to account for slight perspective tilt
-    avg_size_px = (width_px + height_px) / 2.0
-    
-    # Calculate PPM (Pixels / mm)
-    ppm = avg_size_px / marker_size_mm
-    return ppm, ids, image_bgr
+        detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
+        corners, ids, rejected = detector.detectMarkers(image_bgr)
+        
+        if ids is None or len(corners) == 0:
+            return None, None, image_bgr, None
+        
+        # Annotate image
+        annotated = image_bgr.copy()
+        cv2.aruco.drawDetectedMarkers(annotated, corners, ids)
+        
+        # Calculate PPM from first marker
+        c = corners[0][0]
+        width_px = np.linalg.norm(c[0] - c[1])
+        height_px = np.linalg.norm(c[0] - c[3])
+        avg_size_px = (width_px + height_px) / 2.0
+        ppm = avg_size_px / marker_size_mm
+        
+        return ppm, ids, annotated, corners
+        
+    except Exception as e:
+        st.error(f"ArUco detection error: {e}")
+        return None, None, image_bgr, None
 
 def determine_grade(diameter_mm):
     """Classifies diameter against USDA standards."""
@@ -71,175 +79,384 @@ def determine_grade(diameter_mm):
             return grade
     return "Oversized"
 
-def process_onions_yolo(model, image_bgr, ppm, conf_threshold):
+def calculate_ellipse_metrics(contour):
     """
-    Uses YOLOv8-seg to detect onions and measure them using the PPM ratio.
+    Calculates both circular and elliptical metrics for shape analysis.
+    Returns: (ecd, major_axis, minor_axis, eccentricity)
     """
-    # 1. Run Inference
-    results = model(image_bgr, conf=conf_threshold) 
+    area = cv2.contourArea(contour)
     
-    processed_image = image_bgr.copy()
-    onion_data = # Initialize empty list for data collection
+    # Equivalent Circle Diameter
+    ecd = 2 * np.sqrt(area / np.pi)
     
-    # Access the first result object
-    # model() returns a list of Results objects
-    if not results:
-        # Return empty list if no results found to match unpacking in main()
-        return processed_image,
-
-    # Get the first result from the list
-    result = results
+    # Fit ellipse if contour has enough points
+    if len(contour) >= 5:
+        try:
+            ellipse = cv2.fitEllipse(contour)
+            (_, axes, _) = ellipse
+            major_axis = max(axes)
+            minor_axis = min(axes)
+            eccentricity = np.sqrt(1 - (minor_axis**2 / major_axis**2))
+            return ecd, major_axis, minor_axis, eccentricity
+        except:
+            return ecd, ecd, ecd, 0.0
     
-    if result.masks is None:
-        # Return empty list if no masks found to match unpacking in main()
-        return processed_image,
+    return ecd, ecd, ecd, 0.0
 
-    # 2. Iterate over detected instances
-    for i, mask_data in enumerate(result.masks.data):
-        # result.masks.xy gives coordinates of the mask contour
-        # Ultralytics returns list of polygon points
-        polygon = result.masks.xy[i].astype(np.int32)
+def process_onions_yolo(model, image_bgr, ppm, conf_threshold, show_advanced=False):
+    """
+    Detects and measures onions using YOLOv8 instance segmentation.
+    """
+    try:
+        # Run inference
+        results = model(image_bgr, conf=conf_threshold, verbose=False)
         
-        # Check if polygon is valid
-        if len(polygon) == 0:
-            continue
-
-        # Calculate Area using Contour
-        area_px = cv2.contourArea(polygon)
+        if not results or results[0].masks is None:
+            return image_bgr, []
         
-        # 3. Biometric Sizing: Equivalent Circle Diameter (ECD)
-        # This is robust against the "flaky skin" irregular shapes
-        diameter_px = 2 * np.sqrt(area_px / np.pi)
+        result = results[0]
+        processed_image = image_bgr.copy()
+        onion_data = []
         
-        # Convert to Millimeters
-        diameter_mm = diameter_px / ppm
-        grade = determine_grade(diameter_mm)
-        
-        # 4. Visualization
-        # Draw the accurate polygon contour
-        # cv2.polylines expects a list of points
-        cv2.polylines(processed_image, [polygon], isClosed=True, color=(0, 255, 0), thickness=2)
-        
-        # Find center for labeling
-        M = cv2.moments(polygon)
-        if M["m00"]!= 0:
-            cX = int(M["m10"] / M["m00"])
-            cY = int(M["m01"] / M["m00"])
-        else:
-            # Fallback if moment is zero (rare)
-            cX, cY = polygon, polygon[1]
+        # Process each detected instance
+        for i, mask_data in enumerate(result.masks.data):
+            polygon = result.masks.xy[i].astype(np.int32)
             
-        # Label with Grade and Size
-        label = f"{grade}\n{diameter_mm:.1f}mm"
-        # Draw background for text readability
-        (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(processed_image, (cX - 10, cY - 20), (cX + w, cY), (0,0,0), -1)
-        cv2.putText(processed_image, f"{diameter_mm:.1f}mm", (cX, cY - 5), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            if len(polygon) == 0:
+                continue
+            
+            # Calculate metrics
+            area_px = cv2.contourArea(polygon)
+            ecd_px, major_px, minor_px, eccent = calculate_ellipse_metrics(polygon)
+            
+            # Convert to millimeters
+            diameter_mm = ecd_px / ppm
+            major_mm = major_px / ppm
+            minor_mm = minor_px / ppm
+            area_mm2 = area_px / (ppm ** 2)
+            
+            grade = determine_grade(diameter_mm)
+            color = GRADE_COLORS.get(grade, (255, 255, 255))
+            
+            # Draw contour with grade-specific color
+            cv2.polylines(processed_image, [polygon], True, color, 3)
+            
+            # Calculate centroid
+            M = cv2.moments(polygon)
+            if M["m00"] != 0:
+                cX = int(M["m10"] / M["m00"])
+                cY = int(M["m01"] / M["m00"])
+            else:
+                cX, cY = polygon[0][0], polygon[0][1]
+            
+            # Enhanced labeling
+            if show_advanced:
+                label = f"{grade}\n{diameter_mm:.1f}mm\ne={eccent:.2f}"
+            else:
+                label = f"{grade}\n{diameter_mm:.1f}mm"
+            
+            # Draw text background
+            y_offset = 0
+            for line in label.split('\n'):
+                (w, h), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(processed_image, 
+                            (cX - 5, cY - 25 - y_offset), 
+                            (cX + w + 5, cY - y_offset), 
+                            (0, 0, 0), -1)
+                cv2.putText(processed_image, line, 
+                          (cX, cY - 10 - y_offset),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                y_offset += h + 5
+            
+            # Circle centroid
+            cv2.circle(processed_image, (cX, cY), 5, color, -1)
+            
+            # Store data
+            onion_data.append({
+                "ID": i + 1,
+                "Diameter (mm)": round(diameter_mm, 2),
+                "Area (mm²)": round(area_mm2, 2),
+                "Major Axis (mm)": round(major_mm, 2),
+                "Minor Axis (mm)": round(minor_mm, 2),
+                "Eccentricity": round(eccent, 3),
+                "Grade": grade,
+                "Confidence": round(float(result.boxes.conf[i]), 3)
+            })
         
-        onion_data.append({
-            "ID": i+1,
-            "Diameter (mm)": round(diameter_mm, 2),
-            "Grade": grade,
-            "Confidence": float(result.boxes.conf[i])
-        })
+        return processed_image, onion_data
         
-    return processed_image, onion_data
+    except Exception as e:
+        st.error(f"Processing error: {e}")
+        return image_bgr, []
 
-# --- MAIN APP LOGIC ---
+def create_visualizations(df):
+    """Creates interactive Plotly visualizations."""
+    
+    # Grade distribution pie chart
+    grade_counts = df['Grade'].value_counts()
+    fig_pie = px.pie(
+        values=grade_counts.values,
+        names=grade_counts.index,
+        title="Grade Distribution",
+        color_discrete_sequence=px.colors.qualitative.Set2
+    )
+    
+    # Diameter histogram
+    fig_hist = px.histogram(
+        df,
+        x="Diameter (mm)",
+        color="Grade",
+        nbins=20,
+        title="Diameter Distribution by Grade",
+        labels={"Diameter (mm)": "Diameter (mm)", "count": "Frequency"}
+    )
+    
+    # Scatter: Diameter vs Eccentricity
+    fig_scatter = px.scatter(
+        df,
+        x="Diameter (mm)",
+        y="Eccentricity",
+        color="Grade",
+        size="Confidence",
+        hover_data=["ID", "Area (mm²)"],
+        title="Shape Analysis: Diameter vs Roundness"
+    )
+    
+    return fig_pie, fig_hist, fig_scatter
+
 def main():
-    st.set_page_config(page_title="AgriGrade AI: Onion Analytics", layout="wide")
+    st.set_page_config(
+        page_title="AgriGrade AI: Onion Analytics",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
     
-    st.title("🧅 AgriGrade AI: Precision Onion Grading")
+    # Header
+    st.title("🧅 AgriGrade AI: Precision Onion Grading System")
     st.markdown("""
-    **System Status:** Active | **Engine:** YOLOv8-seg + ArUco Metrology
-    
-    This system replaces legacy watershed segmentation with Deep Learning Instance Segmentation 
-    to resolve texture noise issues. It requires a **4x4 ArUco Marker** for absolute sizing.
+    **AI-Powered Onion Sizing & Quality Control** | **Engine:** YOLOv8-seg + ArUco Metrology  
+    *Automated USDA-compliant grading using computer vision and deep learning*
     """)
     
     # Sidebar Configuration
-    st.sidebar.header("Calibration Settings")
-    marker_size = st.sidebar.number_input("ArUco Marker Size (mm)", value=DEFAULT_MARKER_SIZE_MM)
-    conf_threshold = st.sidebar.slider("AI Confidence Threshold", 0.0, 1.0, 0.25, 
-                                       help="Lower value detects more objects but may increase false positives.")
+    st.sidebar.header("⚙️ System Configuration")
     
-    # File Uploader
-    uploaded_file = st.file_uploader("Upload Grading Batch (Top-Down View)", type=['jpg', 'png', 'jpeg'])
+    marker_size = st.sidebar.number_input(
+        "ArUco Marker Size (mm)",
+        min_value=10.0,
+        max_value=200.0,
+        value=DEFAULT_MARKER_SIZE_MM,
+        step=1.0,
+        help="Physical size of your ArUco calibration marker"
+    )
+    
+    conf_threshold = st.sidebar.slider(
+        "AI Confidence Threshold",
+        min_value=0.1,
+        max_value=0.9,
+        value=0.25,
+        step=0.05,
+        help="Lower = more detections (may include false positives)"
+    )
+    
+    show_advanced = st.sidebar.checkbox(
+        "Show Advanced Metrics",
+        value=False,
+        help="Display eccentricity and ellipse measurements"
+    )
+    
+    st.sidebar.divider()
+    st.sidebar.markdown("""
+    ### 📋 USDA Grade Standards
+    - **Small:** < 50.8mm (2")
+    - **Medium:** 50.8-76.2mm (2-3")
+    - **Large:** 76.2-95mm (3-3.75")
+    - **Colossal:** > 95mm (3.75"+)
+    """)
+    
+    # Main content
+    uploaded_file = st.file_uploader(
+        "📁 Upload Batch Image (Top-Down View Required)",
+        type=['jpg', 'png', 'jpeg', 'bmp'],
+        help="Image should contain visible ArUco marker for calibration"
+    )
     
     if uploaded_file:
-        # Load and Decode Image
+        # Load image
         file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-        img_bgr = cv2.imdecode(file_bytes, 1)
+        img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
         
-        # Layout: Two Columns
-        col1, col2 = st.columns(2)
+        if img_bgr is None:
+            st.error("Failed to decode image. Please upload a valid image file.")
+            return
+        
+        # Layout
+        col1, col2 = st.columns([1, 1])
         
         with col1:
-            st.subheader("1. Input & Calibration")
-            # Display original (convert BGR to RGB for Streamlit)
-            st.image(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), caption="Raw Input", use_container_width=True)
+            st.subheader("📷 Input & Calibration")
+            st.image(
+                cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB),
+                caption=f"Original Image ({img_bgr.shape[1]}x{img_bgr.shape[0]})",
+                use_container_width=True
+            )
             
-            # Perform Calibration
-            with st.status("Calibrating Geometry...", expanded=True) as status:
-                ppm, ids, debug_img = detect_aruco_and_get_ppm(img_bgr.copy(), marker_size)
+            # Calibration
+            with st.status("🎯 Performing Calibration...", expanded=True) as status:
+                ppm, ids, debug_img, corners = detect_aruco_and_get_ppm(
+                    img_bgr.copy(),
+                    marker_size
+                )
                 
                 if ppm:
-                    st.write(f"✅ **Marker Detected:** ID {ids.flatten()}")
-                    st.write(f"📏 **Scale Factor:** {ppm:.2f} pixels/mm")
-                    status.update(label="Calibration Complete", state="complete")
+                    st.success(f"✅ Marker Detected: ID {ids.flatten().tolist()}")
+                    st.metric("Scale Factor", f"{ppm:.3f} px/mm")
+                    st.metric("Image Resolution", f"{1000/ppm:.2f} mm per 1000px")
+                    status.update(label="✅ Calibration Complete", state="complete")
                 else:
-                    st.error("❌ No ArUco marker detected.")
-                    st.warning("System will default to pixel measurements (uncalibrated).")
-                    ppm = 1.0 # Fallback to prevent crash
-                    status.update(label="Calibration Failed", state="error")
+                    st.error("❌ No ArUco marker detected")
+                    st.warning("⚠️ Measurements will be in PIXELS (uncalibrated)")
+                    ppm = 1.0
+                    status.update(label="❌ Calibration Failed", state="error")
         
         with col2:
-            st.subheader("2. AI Segmentation & Grading")
+            st.subheader("🤖 AI Segmentation & Grading")
             
-            if ppm == 1.0:
-                st.warning("⚠️ Displaying results in Pixels (Uncalibrated)")
+            # Load model
+            model, error = load_model()
+            if error:
+                st.error(f"Model loading failed: {error}")
+                st.info("Please ensure 'yolov8n-seg.pt' is available or will be downloaded.")
+                return
             
-            with st.spinner("Running YOLOv8 Inference..."):
-                model = load_model()
-                processed_img, data = process_onions_yolo(model, img_bgr.copy(), ppm, conf_threshold)
-                
-                # Display Result
-                st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), 
-                         caption="Segmented & Graded Output", use_container_width=True)
+            with st.spinner("🔍 Running YOLOv8 Inference..."):
+                processed_img, data = process_onions_yolo(
+                    model,
+                    img_bgr.copy(),
+                    ppm,
+                    conf_threshold,
+                    show_advanced
+                )
+            
+            st.image(
+                cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB),
+                caption=f"Segmented Output ({len(data)} onions detected)",
+                use_container_width=True
+            )
         
-        # Data Reporting Section
-        st.divider()
-        st.subheader("3. Batch Analytics")
-        
+        # Analytics Section
         if data:
+            st.divider()
+            st.subheader("📊 Batch Analytics Dashboard")
+            
             df = pd.DataFrame(data)
             
-            # Summary Metrics
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Total Count", len(df))
-            m2.metric("Average Diameter", f"{df.mean(numeric_only=True):.1f} mm")
-            m3.metric("Min Diameter", f"{df.min(numeric_only=True):.1f} mm")
-            m4.metric("Max Diameter", f"{df.max(numeric_only=True):.1f} mm")
+            # Summary metrics
+            metric_cols = st.columns(5)
+            metric_cols[0].metric("🧅 Total Count", len(df))
+            metric_cols[1].metric("📏 Avg Diameter", f"{df['Diameter (mm)'].mean():.1f} mm")
+            metric_cols[2].metric("📐 Min Diameter", f"{df['Diameter (mm)'].min():.1f} mm")
+            metric_cols[3].metric("📐 Max Diameter", f"{df['Diameter (mm)'].max():.1f} mm")
+            metric_cols[4].metric("🎯 Avg Confidence", f"{df['Confidence'].mean():.2%}")
             
-            # Grade Distribution Table
-            grade_counts = df['Grade'].value_counts().reset_index()
-            grade_counts.columns = ['Grade', 'Count']
+            st.divider()
             
-            c1, c2 = st.columns(2)
-            with c1:
-                st.write("#### Grade Distribution")
-                st.dataframe(grade_counts, hide_index=True, use_container_width=True)
-            with c2:
-                st.write("#### Detailed Log")
-                st.dataframe(df, use_container_width=True)
+            # Visualizations
+            tab1, tab2, tab3 = st.tabs(["📈 Charts", "📋 Data Table", "📥 Export"])
+            
+            with tab1:
+                fig_pie, fig_hist, fig_scatter = create_visualizations(df)
                 
-            # CSV Download
-            csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button("Download Batch Report", csv, "onion_grading.csv", "text/csv")
+                chart_col1, chart_col2 = st.columns(2)
+                with chart_col1:
+                    st.plotly_chart(fig_pie, use_container_width=True)
+                with chart_col2:
+                    st.plotly_chart(fig_hist, use_container_width=True)
+                
+                st.plotly_chart(fig_scatter, use_container_width=True)
             
+            with tab2:
+                # Grade distribution
+                st.write("#### 📊 Grade Distribution Summary")
+                grade_summary = df.groupby('Grade').agg({
+                    'ID': 'count',
+                    'Diameter (mm)': ['mean', 'min', 'max'],
+                    'Confidence': 'mean'
+                }).round(2)
+                grade_summary.columns = ['Count', 'Avg Diameter', 'Min Diameter', 'Max Diameter', 'Avg Confidence']
+                st.dataframe(grade_summary, use_container_width=True)
+                
+                st.write("#### 📝 Detailed Measurements")
+                st.dataframe(df, use_container_width=True, hide_index=True)
+            
+            with tab3:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                
+                # CSV Export
+                csv = df.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    "📥 Download CSV Report",
+                    csv,
+                    f"onion_grading_{timestamp}.csv",
+                    "text/csv",
+                    use_container_width=True
+                )
+                
+                # Summary Report
+                summary_text = f"""
+AGRIGRADE AI - BATCH REPORT
+Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+{'='*50}
+
+SUMMARY STATISTICS
+- Total Onions Detected: {len(df)}
+- Average Diameter: {df['Diameter (mm)'].mean():.2f} mm
+- Standard Deviation: {df['Diameter (mm)'].std():.2f} mm
+- Calibration: {ppm:.3f} pixels/mm
+
+GRADE BREAKDOWN
+{df['Grade'].value_counts().to_string()}
+
+QUALITY METRICS
+- Average AI Confidence: {df['Confidence'].mean():.2%}
+- Shape Uniformity (Avg Eccentricity): {df['Eccentricity'].mean():.3f}
+                """
+                
+                st.download_button(
+                    "📄 Download Text Summary",
+                    summary_text,
+                    f"onion_summary_{timestamp}.txt",
+                    "text/plain",
+                    use_container_width=True
+                )
         else:
-            st.info("No onions detected. Adjust confidence threshold or check image lighting.")
+            st.info("🔍 No onions detected. Try adjusting the confidence threshold or check image quality.")
+    
+    else:
+        # Instructions when no file uploaded
+        st.info("👆 Upload an image to begin automated grading")
+        
+        with st.expander("📖 Quick Start Guide"):
+            st.markdown("""
+            1. **Prepare Your Setup:**
+               - Print a 4x4 ArUco marker (ID 0-49)
+               - Measure marker size accurately
+               - Place marker in frame with onions
+            
+            2. **Capture Image:**
+               - Use top-down view (perpendicular to onions)
+               - Ensure good, even lighting
+               - Avoid shadows and reflections
+            
+            3. **Upload & Analyze:**
+               - Upload your image
+               - System auto-calibrates using marker
+               - AI detects and grades each onion
+            
+            4. **Review & Export:**
+               - Check measurements and grades
+               - Download CSV for record-keeping
+            """)
 
 if __name__ == "__main__":
     main()
