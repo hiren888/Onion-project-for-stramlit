@@ -79,14 +79,16 @@ def process_onions_yolo(model, image_bgr, ppm, conf_threshold):
     results = model(image_bgr, conf=conf_threshold) 
     
     processed_image = image_bgr.copy()
-    onion_data = # Fixed: Initialized as empty list
+    onion_data = # Initialize empty list for data collection
     
     # Access the first result object
+    # model() returns a list of Results objects
     if not results:
         # Return empty list if no results found to match unpacking in main()
         return processed_image,
 
-    result = results # Fixed: Access first element of results list
+    # Get the first result from the list
+    result = results
     
     if result.masks is None:
         # Return empty list if no masks found to match unpacking in main()
