@@ -61,33 +61,108 @@ def load_model():
     except Exception as e:
         return None, str(e)
 
-def detect_aruco_and_get_ppm(image_bgr, marker_size_mm):
-    """Detects ArUco marker and calculates PPM ratio."""
-    try:
-        aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT_TYPE)
-        parameters = cv2.aruco.DetectorParameters()
-        parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+def detect_aruco_and_get_ppm(image_bgr, marker_size_mm, dict_type=ARUCO_DICT_TYPE):
+    """
+    Enhanced ArUco detection with multiple strategies.
+    Returns: (ppm, marker_ids, annotated_image, corners, debug_info)
+    """
+    debug_info = {"tried_methods": [], "preprocessing": []}
+    
+    def try_detection(img, method_name, preprocess_func=None):
+        """Helper function to try detection with different preprocessing."""
+        try:
+            # Apply preprocessing if provided
+            if preprocess_func:
+                img_processed = preprocess_func(img)
+                debug_info["preprocessing"].append(method_name)
+            else:
+                img_processed = img
+            
+            aruco_dict = cv2.aruco.getPredefinedDictionary(dict_type)
+            parameters = cv2.aruco.DetectorParameters()
+            
+            # Aggressive detection parameters
+            parameters.adaptiveThreshWinSizeMin = 3
+            parameters.adaptiveThreshWinSizeMax = 23
+            parameters.adaptiveThreshWinSizeStep = 10
+            parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+            parameters.cornerRefinementWinSize = 5
+            parameters.cornerRefinementMaxIterations = 30
+            parameters.minMarkerPerimeterRate = 0.03
+            parameters.maxMarkerPerimeterRate = 4.0
+            
+            detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
+            corners, ids, rejected = detector.detectMarkers(img_processed)
+            
+            debug_info["tried_methods"].append({
+                "method": method_name,
+                "found": ids is not None,
+                "count": len(ids) if ids is not None else 0,
+                "rejected": len(rejected)
+            })
+            
+            return corners, ids, rejected
+            
+        except Exception as e:
+            debug_info["tried_methods"].append({
+                "method": method_name,
+                "error": str(e)
+            })
+            return None, None, None
+    
+    # Strategy 1: Original image
+    corners, ids, rejected = try_detection(image_bgr, "Original")
+    
+    # Strategy 2: Grayscale
+    if ids is None:
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        corners, ids, rejected = try_detection(gray, "Grayscale", lambda x: x)
+    
+    # Strategy 3: Contrast enhancement
+    if ids is None:
+        def enhance_contrast(img):
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+            return clahe.apply(gray)
         
-        detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
-        corners, ids, rejected = detector.detectMarkers(image_bgr)
+        corners, ids, rejected = try_detection(image_bgr, "CLAHE Enhanced", enhance_contrast)
+    
+    # Strategy 4: Bilateral filter (noise reduction)
+    if ids is None:
+        def denoise(img):
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            return cv2.bilateralFilter(gray, 9, 75, 75)
         
-        if ids is None or len(corners) == 0:
-            return None, None, image_bgr, None
+        corners, ids, rejected = try_detection(image_bgr, "Denoised", denoise)
+    
+    # Strategy 5: Adaptive thresholding
+    if ids is None:
+        def adaptive_thresh(img):
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                        cv2.THRESH_BINARY, 11, 2)
         
-        annotated = image_bgr.copy()
-        cv2.aruco.drawDetectedMarkers(annotated, corners, ids)
-        
-        c = corners[0][0]
-        width_px = np.linalg.norm(c[0] - c[1])
-        height_px = np.linalg.norm(c[0] - c[3])
-        avg_size_px = (width_px + height_px) / 2.0
-        ppm = avg_size_px / marker_size_mm
-        
-        return ppm, ids, annotated, corners
-        
-    except Exception as e:
-        st.error(f"ArUco detection error: {e}")
-        return None, None, image_bgr, None
+        corners, ids, rejected = try_detection(image_bgr, "Adaptive Threshold", adaptive_thresh)
+    
+    # If still not found, return None with debug info
+    if ids is None or len(corners) == 0:
+        return None, None, image_bgr, None, debug_info
+    
+    # Calculate PPM
+    annotated = image_bgr.copy()
+    cv2.aruco.drawDetectedMarkers(annotated, corners, ids)
+    
+    c = corners[0][0]
+    width_px = np.linalg.norm(c[0] - c[1])
+    height_px = np.linalg.norm(c[0] - c[3])
+    avg_size_px = (width_px + height_px) / 2.0
+    ppm = avg_size_px / marker_size_mm
+    
+    debug_info["success"] = True
+    debug_info["marker_id"] = int(ids[0][0])
+    debug_info["avg_size_px"] = float(avg_size_px)
+    
+    return ppm, ids, annotated, corners, debug_info
 
 def determine_grade(diameter_mm):
     """Classifies diameter against USDA standards."""
@@ -114,10 +189,10 @@ def calculate_ellipse_metrics(contour):
     
     return ecd, ecd, ecd, 0.0
 
-def process_onions_yolo(model, image_bgr, ppm, conf_threshold, show_advanced=False):
+def process_onions_yolo(model, image_bgr, ppm, conf_threshold, iou_threshold, show_advanced=False):
     """Detects and measures onions using YOLOv8."""
     try:
-        results = model(image_bgr, conf=conf_threshold, verbose=False)
+        results = model(image_bgr, conf=conf_threshold, iou=iou_threshold, verbose=False)
         
         if not results or results[0].masks is None:
             return image_bgr, []
@@ -302,6 +377,25 @@ def main():
     # Sidebar Configuration
     st.sidebar.header("⚙️ System Configuration")
     
+    # ArUco Dictionary Selection
+    aruco_dict_options = {
+        "4x4 (50 markers)": cv2.aruco.DICT_4X4_50,
+        "4x4 (100 markers)": cv2.aruco.DICT_4X4_100,
+        "4x4 (250 markers)": cv2.aruco.DICT_4X4_250,
+        "5x5 (50 markers)": cv2.aruco.DICT_5X5_50,
+        "6x6 (50 markers)": cv2.aruco.DICT_6X6_50,
+        "7x7 (50 markers)": cv2.aruco.DICT_7X7_50,
+    }
+    
+    selected_dict = st.sidebar.selectbox(
+        "ArUco Dictionary Type",
+        options=list(aruco_dict_options.keys()),
+        index=0,
+        help="Select the dictionary used to generate your marker"
+    )
+    
+    aruco_dict_type = aruco_dict_options[selected_dict]
+    
     marker_size = st.sidebar.number_input(
         "ArUco Marker Size (mm)",
         min_value=10.0,
@@ -318,6 +412,15 @@ def main():
         value=0.25,
         step=0.05,
         help="Lower = more detections (may include false positives)"
+    )
+    
+    iou_threshold = st.sidebar.slider(
+        "IoU Threshold (Overlap Filter)",
+        min_value=0.1,
+        max_value=0.9,
+        value=0.45,
+        step=0.05,
+        help="Higher = less overlap tolerance between detections"
     )
     
     show_advanced = st.sidebar.checkbox(
@@ -361,19 +464,49 @@ def main():
             )
             
             with st.status("🎯 Performing Calibration...", expanded=True) as status:
-                ppm, ids, debug_img, corners = detect_aruco_and_get_ppm(
+                ppm, ids, debug_img, corners, debug_info = detect_aruco_and_get_ppm(
                     img_bgr.copy(),
-                    marker_size
+                    marker_size,
+                    aruco_dict_type
                 )
                 
                 if ppm:
                     st.success(f"✅ Marker Detected: ID {ids.flatten().tolist()}")
                     st.metric("Scale Factor", f"{ppm:.3f} px/mm")
                     st.metric("Image Resolution", f"{1000/ppm:.2f} mm per 1000px")
+                    
+                    # Show which method worked
+                    successful_method = next((m for m in debug_info["tried_methods"] if m.get("found")), None)
+                    if successful_method:
+                        st.info(f"✨ Detection method: {successful_method['method']}")
+                    
                     status.update(label="✅ Calibration Complete", state="complete")
                 else:
                     st.error("❌ No ArUco marker detected")
                     st.warning("⚠️ Measurements will be in PIXELS (uncalibrated)")
+                    
+                    # Show diagnostic information
+                    with st.expander("🔍 View Detection Diagnostics"):
+                        st.write("**Attempted Detection Methods:**")
+                        for method in debug_info["tried_methods"]:
+                            if "error" in method:
+                                st.write(f"❌ {method['method']}: Error - {method['error']}")
+                            else:
+                                st.write(f"{'✅' if method['found'] else '❌'} {method['method']}: Found {method['count']}, Rejected {method['rejected']}")
+                        
+                        st.write("**Troubleshooting Tips:**")
+                        st.markdown("""
+                        1. **Check marker dictionary type** - Try different dictionaries in sidebar
+                        2. **Verify marker is visible** - Ensure entire marker is in frame
+                        3. **Improve lighting** - Avoid shadows and glare on marker
+                        4. **Check marker quality** - Print should be clear, not blurry
+                        5. **Distance matters** - Marker should occupy at least 5-10% of image
+                        6. **Flat surface** - Marker should be on same plane as onions
+                        """)
+                        
+                        st.write("**Need a marker?**")
+                        st.markdown("[🔗 Generate ArUco Marker Online](https://chev.me/arucogen/)")
+                    
                     ppm = 1.0
                     status.update(label="❌ Calibration Failed", state="error")
         
@@ -391,6 +524,7 @@ def main():
                     img_bgr.copy(),
                     ppm,
                     conf_threshold,
+                    iou_threshold,
                     show_advanced
                 )
             
@@ -490,6 +624,101 @@ QUALITY METRICS
     
     else:
         st.info("👆 Upload an image to begin automated grading")
+        
+        # ArUco Marker Generator Section
+        st.divider()
+        st.subheader("🎯 ArUco Marker Setup Guide")
+        
+        col_guide1, col_guide2 = st.columns(2)
+        
+        with col_guide1:
+            st.markdown("""
+            ### 📋 What You Need
+            
+            An **ArUco marker** is a square fiducial marker used for calibration. It looks like a QR code with a black border and internal pattern.
+            
+            **Why do you need it?**
+            - Converts pixel measurements to real-world millimeters
+            - Ensures accurate sizing across different cameras/distances
+            - Required for USDA-compliant measurements
+            
+            **Marker Requirements:**
+            - ✅ Black & white (high contrast)
+            - ✅ Printed on flat, white paper
+            - ✅ No wrinkles or distortion
+            - ✅ Same plane as onions (lay flat)
+            """)
+        
+        with col_guide2:
+            st.markdown("""
+            ### 🖨️ How to Create Your Marker
+            
+            **Step 1: Generate Marker**
+            - Visit: [ArUco Generator](https://chev.me/arucogen/)
+            - Select: **4x4 (50 markers)** dictionary
+            - Choose: **Marker ID 0** (or any 0-49)
+            - Size: Set to your desired print size
+            
+            **Step 2: Print**
+            - Print at 100% scale (no scaling!)
+            - Use white paper, black ink
+            - Measure the printed size precisely
+            
+            **Step 3: Setup**
+            - Place marker near onions
+            - Ensure entire marker is visible
+            - Keep marker flat and unobstructed
+            """)
+        
+        # Common Issues
+        with st.expander("⚠️ Common Detection Issues"):
+            st.markdown("""
+            | Problem | Solution |
+            |---------|----------|
+            | Marker too small | Marker should be 5-10% of image size |
+            | Poor lighting | Use diffuse lighting, avoid shadows |
+            | Marker damaged | Ensure clean, clear print |
+            | Wrong dictionary | Try different dictionary types in sidebar |
+            | Perspective distortion | Take photo perpendicular to marker |
+            | Partial visibility | Ensure all 4 corners are visible |
+            """)
+        
+        # Quick test feature
+        st.divider()
+        test_file = st.file_uploader(
+            "🧪 Test Marker Detection Only (Optional)",
+            type=['jpg', 'png', 'jpeg'],
+            help="Upload an image to test if your ArUco marker is detectable",
+            key="test_marker"
+        )
+        
+        if test_file:
+            test_bytes = np.asarray(bytearray(test_file.read()), dtype=np.uint8)
+            test_img = cv2.imdecode(test_bytes, cv2.IMREAD_COLOR)
+            
+            if test_img is not None:
+                test_col1, test_col2 = st.columns(2)
+                
+                with test_col1:
+                    st.image(cv2.cvtColor(test_img, cv2.COLOR_BGR2RGB), 
+                            caption="Test Image", use_container_width=True)
+                
+                with test_col2:
+                    with st.spinner("Testing detection..."):
+                        ppm_test, ids_test, debug_test, _, debug_info_test = detect_aruco_and_get_ppm(
+                            test_img, marker_size, aruco_dict_type
+                        )
+                    
+                    if ppm_test:
+                        st.success(f"✅ SUCCESS! Marker ID {ids_test.flatten().tolist()} detected")
+                        st.image(cv2.cvtColor(debug_test, cv2.COLOR_BGR2RGB), 
+                                caption="Detected Marker", use_container_width=True)
+                    else:
+                        st.error("❌ No marker detected in test image")
+                        
+                        for method in debug_info_test["tried_methods"]:
+                            if "error" not in method:
+                                st.write(f"{'✅' if method['found'] else '❌'} {method['method']}: {method['count']} found, {method['rejected']} rejected")
         
         with st.expander("📖 Quick Start Guide"):
             st.markdown("""
