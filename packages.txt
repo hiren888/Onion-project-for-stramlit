@@ -1,2 +1,3 @@
-libgl1
-libglib2.0-0
+libgl1-mesa-glx
+
+This tells the server to install the necessary graphics libraries for OpenCV. Good luck with the project!
