@@ -38,6 +38,7 @@ def detect_aruco_and_get_ppm(image_bgr, marker_size_mm):
     # Critical for accuracy: Sub-pixel refinement
     parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
     
+    # Updated for OpenCV 4.8+: Use ArucoDetector class
     detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
     corners, ids, rejected = detector.detectMarkers(image_bgr)
     
@@ -49,11 +50,12 @@ def detect_aruco_and_get_ppm(image_bgr, marker_size_mm):
     
     # Use the first detected marker to calculate scale
     # Corners structure: [top-left, top-right, bottom-right, bottom-left]
-    c = corners 
+    # We take the first marker found (index 0)
+    c = corners
     
     # Calculate Euclidean distance of the top edge and left edge in pixels
-    width_px = np.linalg.norm(c - c)
-    height_px = np.linalg.norm(c - c)
+    width_px = np.linalg.norm(c - c[1])
+    height_px = np.linalg.norm(c - c[2])
     
     # Average the sides to account for slight perspective tilt
     avg_size_px = (width_px + height_px) / 2.0
@@ -83,6 +85,10 @@ def process_onions_yolo(model, image_bgr, ppm, conf_threshold):
     onion_data =
     
     # Access the first result object
+    # model() returns a list of Results objects, we take the first one
+    if not results:
+        return processed_image,
+
     result = results
     
     if result.masks is None:
@@ -90,15 +96,7 @@ def process_onions_yolo(model, image_bgr, ppm, conf_threshold):
 
     # 2. Iterate over detected instances
     for i, mask_data in enumerate(result.masks.data):
-        # YOLOv8 masks are float tensors , convert to binary mask
-        mask_cpu = mask_data.cpu().numpy()
-        
-        # Resize mask to original image dimensions if necessary
-        # Ultralytics results.masks.data is typically lower res (160x160)
-        # We use results.masks.xy for exact polygon coordinates on original image
-        
-        # Get Polygon Coordinates (more accurate than resizing raster mask)
-        # result.masks.xy is a list of arrays, one per object
+        # result.masks.xy gives coordinates of the mask contour
         polygon = result.masks.xy[i].astype(np.int32)
         
         # Calculate Area using Contour
@@ -114,6 +112,7 @@ def process_onions_yolo(model, image_bgr, ppm, conf_threshold):
         
         # 4. Visualization
         # Draw the accurate polygon contour
+        # cv2.polylines expects a list of points
         cv2.polylines(processed_image, [polygon], isClosed=True, color=(0, 255, 0), thickness=2)
         
         # Find center for labeling
@@ -122,7 +121,8 @@ def process_onions_yolo(model, image_bgr, ppm, conf_threshold):
             cX = int(M["m10"] / M["m00"])
             cY = int(M["m01"] / M["m00"])
         else:
-            cX, cY = polygon, polygon
+            # Fallback if moment is zero (rare)
+            cX, cY = polygon, polygon[1]
             
         # Label with Grade and Size
         label = f"{grade}\n{diameter_mm:.1f}mm"
@@ -221,7 +221,7 @@ def main():
             grade_counts = df['Grade'].value_counts().reset_index()
             grade_counts.columns = ['Grade', 'Count']
             
-            c1, c2 = st.columns()
+            c1, c2 = st.columns(2)
             with c1:
                 st.write("#### Grade Distribution")
                 st.dataframe(grade_counts, hide_index=True, use_container_width=True)
