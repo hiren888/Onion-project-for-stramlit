@@ -76,21 +76,17 @@ def process_onions_yolo(model, image_bgr, ppm, conf_threshold):
     Uses YOLOv8-seg to detect onions and measure them using the PPM ratio.
     """
     # 1. Run Inference
-    # Note: 'classes' argument can filter specific COCO classes (e.g., 46=banana, 49=orange)
-    # Ideally, use a custom model trained specifically on Onions.
-    # Here we accept all detections for demonstration or assume custom weights.
     results = model(image_bgr, conf=conf_threshold) 
     
     processed_image = image_bgr.copy()
-    onion_data =  # Initialize empty list to avoid SyntaxError
+    onion_data = # Fixed: Initialized as empty list
     
     # Access the first result object
-    # model() returns a list of Results objects, we take the first one
     if not results:
         # Return empty list if no results found to match unpacking in main()
         return processed_image,
 
-    result = results
+    result = results # Fixed: Access first element of results list
     
     if result.masks is None:
         # Return empty list if no masks found to match unpacking in main()
@@ -99,8 +95,13 @@ def process_onions_yolo(model, image_bgr, ppm, conf_threshold):
     # 2. Iterate over detected instances
     for i, mask_data in enumerate(result.masks.data):
         # result.masks.xy gives coordinates of the mask contour
+        # Ultralytics returns list of polygon points
         polygon = result.masks.xy[i].astype(np.int32)
         
+        # Check if polygon is valid
+        if len(polygon) == 0:
+            continue
+
         # Calculate Area using Contour
         area_px = cv2.contourArea(polygon)
         
@@ -124,10 +125,7 @@ def process_onions_yolo(model, image_bgr, ppm, conf_threshold):
             cY = int(M["m01"] / M["m00"])
         else:
             # Fallback if moment is zero (rare)
-            if len(polygon) > 0:
-                cX, cY = polygon, polygon[1]
-            else:
-                continue # Skip if polygon is invalid
+            cX, cY = polygon, polygon[1]
             
         # Label with Grade and Size
         label = f"{grade}\n{diameter_mm:.1f}mm"
@@ -218,9 +216,9 @@ def main():
             # Summary Metrics
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Total Count", len(df))
-            m2.metric("Average Diameter", f"{df.mean():.1f} mm")
-            m3.metric("Min Diameter", f"{df.min():.1f} mm")
-            m4.metric("Max Diameter", f"{df.max():.1f} mm")
+            m2.metric("Average Diameter", f"{df.mean(numeric_only=True):.1f} mm")
+            m3.metric("Min Diameter", f"{df.min(numeric_only=True):.1f} mm")
+            m4.metric("Max Diameter", f"{df.max(numeric_only=True):.1f} mm")
             
             # Grade Distribution Table
             grade_counts = df['Grade'].value_counts().reset_index()
