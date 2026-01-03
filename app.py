@@ -1,10 +1,32 @@
+"""
+🧅 Onion Grading App
+--------------------
+System Requirements & Deployment Guide:
+
+1. Python Dependencies (requirements.txt):
+   Create a file named 'requirements.txt' with these lines:
+   streamlit
+   opencv-python-headless
+   numpy
+   pandas
+   pillow
+   ultralytics
+   plotly
+
+2. System Dependencies (packages.txt - for Streamlit Cloud):
+   Create a file named 'packages.txt' with this single line:
+   libgl1-mesa-glx
+
+   ⚠️ IMPORTANT: The error "Couldn't find any package by glob 'project!'" 
+   usually happens if 'packages.txt' contains invalid text (like the word 'project!'). 
+   Ensure 'packages.txt' ONLY contains 'libgl1-mesa-glx'.
+"""
+
 import streamlit as st
 import cv2
 import numpy as np
 from PIL import Image, ExifTags
 import pandas as pd
-from datetime import datetime
-import io
 import gc
 
 # --- OPTIONAL DEPENDENCIES ---
@@ -55,8 +77,9 @@ def load_model():
         return None, "ultralytics package not installed"
     
     try:
-        # Downloads the model if not present locally
-        model = YOLO('yolov8n-seg.pt')
+        # Switched to 's' (small) instead of 'n' (nano) for better accuracy
+        # The generic model isn't trained on onions, so 's' helps it generalize better.
+        model = YOLO('yolov8s-seg.pt')
         return model, None
     except Exception as e:
         return None, str(e)
@@ -171,7 +194,16 @@ def determine_grade(diameter_mm):
 def process_onions_yolo(model, image_bgr, ppm, conf_threshold, iou_threshold, measure_mode="Equivalent Diameter"):
     """Detects and measures onions."""
     try:
-        results = model(image_bgr, conf=conf_threshold, iou=iou_threshold, verbose=False)
+        # Run inference with agnostic_nms=True to prevent overlapping "different" objects from persisting
+        # retina_masks=True improves segmentation quality
+        results = model(
+            image_bgr, 
+            conf=conf_threshold, 
+            iou=iou_threshold, 
+            agnostic_nms=True,
+            retina_masks=True,
+            verbose=False
+        )
         
         if not results or results[0].masks is None:
             return image_bgr, []
@@ -276,7 +308,15 @@ def main():
     st.sidebar.divider()
     
     # AI Settings
-    conf_thresh = st.sidebar.slider("AI Confidence", 0.1, 0.9, 0.25)
+    st.sidebar.markdown("### 🧠 AI Parameters")
+    # Reduced default confidence to 0.15 to detect more onions
+    conf_thresh = st.sidebar.slider("AI Confidence", 0.05, 0.9, 0.15, 
+                                  help="Lower values detect more objects but may include errors.")
+    
+    # Increased IoU threshold to 0.50 to handle touching onions better
+    iou_thresh = st.sidebar.slider("Overlap Threshold (IoU)", 0.1, 0.9, 0.50,
+                                 help="Higher values allow more overlapping/touching objects.")
+    
     measure_mode = st.sidebar.selectbox("Measurement Basis", 
                                       ["Equivalent Diameter", "Major Axis", "Minor Axis"],
                                       help="Equivalent: Based on area. Major/Minor: Based on ellipse fit.")
@@ -333,8 +373,9 @@ def main():
             if model:
                 with col2:
                     with st.spinner("Analyzing onions..."):
+                        # Pass user-defined IoU threshold
                         processed_img, data = process_onions_yolo(
-                            model, img_bgr, ppm, conf_thresh, 0.45, measure_mode
+                            model, img_bgr, ppm, conf_thresh, iou_thresh, measure_mode
                         )
                         
                         st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), 
@@ -368,6 +409,9 @@ def main():
                     # CSV Download
                     csv = df.to_csv(index=False).encode('utf-8')
                     st.download_button("Download Data (CSV)", csv, "onion_data.csv", "text/csv")
+                else:
+                    st.warning("No onions detected with current settings.")
+                    st.info("💡 Tip: Try lowering the 'AI Confidence' slider in the sidebar.")
             else:
                 st.error(f"Could not load AI model: {err}")
         
