@@ -1,10 +1,10 @@
 import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image, ExifTags
+from PIL import Image
 import pandas as pd
 import gc
-from roboflow import Roboflow
+from inference_sdk import InferenceHTTPClient
 
 # --- CONFIGURATION ---
 GRADE_STANDARDS = {
@@ -23,13 +23,14 @@ GRADE_COLORS = {
 
 @st.cache_resource
 def load_model():
-    """Initializes the Roboflow API Client."""
+    """Initializes the Roboflow Workflow Client."""
     api_key = st.secrets.get("ROBOFLOW_API_KEY", "YOUR_API_KEY_HERE")
     try:
-        rf = Roboflow(api_key=api_key)
-        project = rf.workspace("onion-project").project("onion-project-slug")
-        model = project.version(1).model # Ensure version matches your training
-        return model, None
+        client = InferenceHTTPClient(
+            api_url="https://serverless.roboflow.com",
+            api_key=api_key
+        )
+        return client, None
     except Exception as e:
         return None, str(e)
 
@@ -39,30 +40,49 @@ def determine_grade(diameter_mm):
             return grade
     return "Oversized"
 
-def process_onions(model, image_bgr, ppm, conf_threshold):
-    """Detects and measures onions using the standard Hosted API."""
+def process_onions_workflow(client, image_bgr, ppm, conf_threshold):
+    """Parses Workflow response by indexing the list first."""
     try:
-        # Save temp image for the API to read
-        cv2.imwrite("temp.jpg", image_bgr)
+        # 1. Call the Workflow
+        # Replace these with your actual IDs from the 'Rapid' project URL
+        result = client.run_workflow(
+            workspace_name="onion-project",
+            workflow_id="find-onions",
+            images={"image": image_bgr}
+        )
+
+        # 2. Fix the 'List' vs 'Dict' structure
+        # Workflows return a list: [{'outputs': {...}}]
+        if isinstance(result, list):
+            raw_output = result[0]
+        else:
+            raw_output = result
+
+        # 3. Drill down to the predictions
+        # We look for 'predictions' inside 'outputs'
+        outputs = raw_output.get('outputs', {})
         
-        # Run inference
-        response = model.predict("temp.jpg", confidence=conf_threshold).json()
-        predictions = response.get('predictions', [])
+        # This checks the most common keys Workflows use for detection blocks
+        predictions = outputs.get('predictions') or outputs.get('detections') or []
 
         processed_image = image_bgr.copy()
         onion_data = []
 
         for i, p in enumerate(predictions):
-            # Roboflow returns x, y (center), width, and height in pixels
-            w_px, h_px = p['width'], p['height']
-            x_c, y_c = p['x'], p['y']
+            conf = p.get('confidence', 0)
+            if conf < conf_threshold:
+                continue
             
-            # Diameter Calculation (Standardized to Major Axis)
+            # Extract box dimensions
+            w_px, h_px = p.get('width', 0), p.get('height', 0)
+            x_c, y_c = p.get('x', 0), p.get('y', 0)
+            
+            # Diameter Math
             diameter_mm = max(w_px, h_px) / ppm
             grade = determine_grade(diameter_mm)
             color = GRADE_COLORS.get(grade, (255, 255, 255))
             
-            # Draw Bounding Box
+            # Draw on Image
             x1, y1 = int(x_c - w_px/2), int(y_c - h_px/2)
             x2, y2 = int(x_c + w_px/2), int(y_c + h_px/2)
             cv2.rectangle(processed_image, (x1, y1), (x2, y2), color, 4)
@@ -73,56 +93,54 @@ def process_onions(model, image_bgr, ppm, conf_threshold):
                 "ID": i + 1,
                 "Diameter (mm)": round(diameter_mm, 2),
                 "Grade": grade,
-                "Confidence": round(p['confidence'], 2)
+                "Confidence": round(float(conf), 2)
             })
             
         return processed_image, onion_data
+
     except Exception as e:
-        st.error(f"Inference Error: {e}")
+        st.error(f"Workflow Logic Error: {e}")
+        # This will show you exactly what the API sent back so we can fix it
+        with st.expander("See Raw System Response"):
+            st.write(result)
         return image_bgr, []
 
 def main():
     st.set_page_config(page_title="AgriGrade AI", layout="wide")
-    st.title("🧅 Onion Size Distribution App")
+    st.title("🧅 Onion Grading System (Roboflow Rapid)")
     
-    # Sidebar
     st.sidebar.header("Settings")
-    ppm = st.sidebar.number_input("Pixels per mm (Calibration)", 0.1, 50.0, 5.0)
+    ppm = st.sidebar.number_input("Scale (Pixels per mm)", 0.1, 100.0, 5.0)
     conf = st.sidebar.slider("AI Confidence", 0.1, 0.9, 0.4)
     
-    model, err = load_model()
+    client, err = load_model()
     if err:
-        st.error(f"API Connection Failed: {err}")
+        st.error(f"API Connection Error: {err}")
         st.stop()
 
     uploaded_file = st.file_uploader("Upload Image", type=['jpg', 'jpeg', 'png'])
     
     if uploaded_file:
-        img = Image.open(uploaded_file)
-        img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        img_pil = Image.open(uploaded_file)
+        img_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
         with st.spinner("Analyzing Stock..."):
-            processed_img, data = process_onions(model, img_bgr, ppm, conf*100)
+            processed_img, data = process_onions_workflow(client, img_bgr, ppm, conf)
             
             col1, col2 = st.columns(2)
-            col1.image(img, caption="Original", use_container_width=True)
-            col2.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), caption="Graded", use_container_width=True)
+            col1.image(img_pil, caption="Original", use_container_width=True)
+            col2.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), caption="Graded Results", use_container_width=True)
 
         if data:
             df = pd.DataFrame(data)
             st.success(f"Detected {len(df)} onions.")
-            
-            # Analytics
-            st.subheader("📊 Distribution Data")
+            st.subheader("📊 Distribution Analysis")
             st.dataframe(df, use_container_width=True)
             
-            # Summary Metrics
-            c1, c2 = st.columns(2)
-            c1.metric("Average Diameter", f"{df['Diameter (mm)'].mean():.1f} mm")
-            c2.metric("Top Grade", df['Grade'].mode()[0])
-            
             csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button("Download CSV Report", csv, "onion_report.csv", "text/csv")
+            st.download_button("Download Report (CSV)", csv, "onion_report.csv")
+        else:
+            st.info("No onions detected. Check 'See Raw System Response' expander for details.")
 
     gc.collect()
 
