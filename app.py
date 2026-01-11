@@ -7,7 +7,6 @@ import gc
 from inference_sdk import InferenceHTTPClient
 
 # --- CONFIGURATION ---
-# Industry standard onion grades (mm)
 GRADE_STANDARDS = {
     "Small": (0, 50.8),
     "Medium": (50.8, 76.2),
@@ -26,8 +25,7 @@ GRADE_COLORS = {
 @st.cache_resource
 def load_model():
     """Initializes the Roboflow Workflow Client."""
-    # It is safer to use st.secrets for GitHub. 
-    # If testing locally without secrets.toml, replace with your string.
+    # Priority: 1. Streamlit Secrets, 2. Hardcoded (for local testing)
     api_key = st.secrets.get("ROBOFLOW_API_KEY", "YOUR_API_KEY_HERE")
     
     try:
@@ -62,41 +60,61 @@ def determine_grade(diameter_mm):
     return "Oversized"
 
 def process_onions_workflow(client, image_bgr, ppm, conf_threshold):
-    """Detects and measures onions using Roboflow Workflows."""
+    """Detects and measures onions with deep error inspection."""
     try:
-        # Run Workflow - Removed 'use_cache' to prevent SDK version errors
+        # 1. Run Workflow
+        # Ensure workspace_name and workflow_id match your Roboflow project URL
         result = client.run_workflow(
             workspace_name="onion-project",
             workflow_id="find-onions",
             images={"image": image_bgr}
         )
         
-        # Handle list vs dict response structure
-        workflow_output = result[0] if isinstance(result, list) else result
-        
-        # Access the 'outputs' dictionary safely
+        # 2. Show the Raw API Response in an expander for debugging
+        with st.expander("🔍 System Debug: Raw API Response"):
+            st.write(result)
+
+        if not result:
+            st.error("The API returned an empty result.")
+            return image_bgr, []
+
+        # 3. Handle the 'list' vs 'dict' structure safely
+        # Workflows return a list [ { 'outputs': ... } ]
+        if isinstance(result, list) and len(result) > 0:
+            workflow_output = result[0]
+        elif isinstance(result, dict):
+            workflow_output = result
+        else:
+            st.error(f"Unexpected response format: {type(result)}")
+            return image_bgr, []
+
+        # 4. Access 'outputs' safely
+        if not hasattr(workflow_output, 'get'):
+            st.error("Workflow output is not in the expected dictionary format.")
+            return image_bgr, []
+
         output_data = workflow_output.get('outputs', {})
         
-        # NOTE: If your workflow output block is not named 'predictions', 
-        # change the key below to match your Roboflow Workflow naming.
-        predictions = output_data.get('predictions', []) 
+        # 5. Find the detections key (tries 'predictions' then 'detections')
+        predictions = output_data.get('predictions') or output_data.get('detections') or []
 
         processed_image = image_bgr.copy()
         onion_data = []
         
         for i, p in enumerate(predictions):
-            if p.get('confidence', 0) < conf_threshold:
+            conf = p.get('confidence', 0)
+            if conf < conf_threshold:
                 continue
                 
-            w_px, h_px = p['width'], p['height']
-            x_c, y_c = p['x'], p['y']
+            w_px, h_px = p.get('width', 0), p.get('height', 0)
+            x_c, y_c = p.get('x', 0), p.get('y', 0)
             
-            # Calculate Physical Diameter (using Major Axis)
+            # Measurement (Using max dimension for diameter)
             diameter_mm = max(w_px, h_px) / ppm
             grade = determine_grade(diameter_mm)
             color = GRADE_COLORS.get(grade, (255, 255, 255))
             
-            # Draw on Image
+            # Draw Box (Standardized OpenCV logic)
             x1, y1 = int(x_c - w_px/2), int(y_c - h_px/2)
             x2, y2 = int(x_c + w_px/2), int(y_c + h_px/2)
             cv2.rectangle(processed_image, (x1, y1), (x2, y2), color, 4)
@@ -107,34 +125,30 @@ def process_onions_workflow(client, image_bgr, ppm, conf_threshold):
                 "ID": i + 1,
                 "Diameter (mm)": round(diameter_mm, 2),
                 "Grade": grade,
-                "Confidence": round(float(p['confidence']), 2)
+                "Confidence": round(float(conf), 2)
             })
             
         return processed_image, onion_data
+
     except Exception as e:
         st.error(f"Workflow Processing Error: {e}")
-        # Show raw result in case of error to help user debug names
-        with st.expander("Show Raw API Response"):
-            st.write(result)
         return image_bgr, []
 
 def main():
     st.set_page_config(page_title="AgriGrade AI", layout="wide")
-    st.title("🧅 AgriGrade AI: Onion Size Distribution")
+    st.title("🧅 AgriGrade AI: Onion Sizing")
     
-    # Sidebar Configuration
-    st.sidebar.title("⚙️ Calibration & AI")
-    # Reference: 1080p photo at 1 meter often has a ppm around 3.5-5.0
-    ppm = st.sidebar.number_input("Pixels per mm (Scale)", 0.1, 100.0, 5.0, 
-                                  help="Calibrate this by dividing an object's pixel width by its real mm width.")
-    conf_thresh = st.sidebar.slider("AI Confidence Threshold", 0.1, 0.9, 0.4)
+    st.sidebar.title("⚙️ Calibration")
+    # A standard starting point for many mobile cameras is ~5.0 ppm
+    ppm = st.sidebar.number_input("Pixels per mm (Scale)", 0.1, 100.0, 5.0)
+    conf_thresh = st.sidebar.slider("AI Confidence", 0.1, 0.9, 0.4)
     
     client, err = load_model()
     if err:
-        st.error(f"Connection Error: {err}")
+        st.error(f"Failed to connect to AI: {err}")
         st.stop()
 
-    uploaded_file = st.file_uploader("Upload Onion Stock Photo", type=['jpg', 'jpeg', 'png'])
+    uploaded_file = st.file_uploader("Upload Onion Photo", type=['jpg', 'jpeg', 'png'])
     
     if uploaded_file:
         image_pil = Image.open(uploaded_file)
@@ -143,32 +157,31 @@ def main():
 
         col1, col2 = st.columns(2)
         with col1:
-            st.image(image_pil, caption="Original Image", use_container_width=True)
+            st.image(image_pil, caption="Original", use_container_width=True)
             
         with col2:
-            with st.spinner("Analyzing onions via Roboflow Cloud..."):
+            with st.spinner("Analyzing with Roboflow Workflow..."):
                 processed_img, data = process_onions_workflow(client, img_bgr, ppm, conf_thresh)
                 st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), 
-                         caption=f"Analysis Complete: {len(data)} detected", use_container_width=True)
+                         caption=f"Detected: {len(data)} Onions", use_container_width=True)
 
         if data:
             df = pd.DataFrame(data)
             st.divider()
             
-            # KPI Metrics
+            # Metrics
             m1, m2, m3 = st.columns(3)
-            m1.metric("Sample Count", len(df))
+            m1.metric("Total Count", len(df))
             m2.metric("Avg Diameter", f"{df['Diameter (mm)'].mean():.1f} mm")
             m3.metric("Dominant Grade", df['Grade'].mode()[0])
             
-            # Data View
-            st.subheader("📋 Detailed Measurements")
+            st.subheader("📊 Distribution Data")
             st.dataframe(df, use_container_width=True)
             
             csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button("📩 Download Data (CSV)", csv, "onion_distribution.csv")
+            st.download_button("📩 Download Results (CSV)", csv, "onion_report.csv")
         else:
-            st.warning("No onions detected. Check your 'Confidence' setting or your Workflow Output names.")
+            st.info("No onions detected. Adjust the Confidence slider or check the Debug Expander above.")
 
     gc.collect()
 
