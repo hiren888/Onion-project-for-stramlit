@@ -71,7 +71,7 @@ def process_onions_workflow(client, image_bgr, ppm, conf_threshold):
             workspace_name="onion-project",
             workflow_id="find-onions",
             images={"image": image_bgr},
-            use_cache=True
+            
         )
         
         # Access predictions from the workflow output
