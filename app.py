@@ -23,13 +23,14 @@ GRADE_COLORS = {
 
 @st.cache_resource
 def load_model():
-    """Initializes the Roboflow API Client for Version 6."""
+    """Initializes the Roboflow API Client for Version 9."""
+    # Ensure your API Key is in Streamlit Secrets
     api_key = st.secrets.get("ROBOFLOW_API_KEY", "YOUR_API_KEY_HERE")
     try:
         rf = Roboflow(api_key=api_key)
-        # Using IDs from your URL: https://app.roboflow.com/onion-project/onion-tydja/6
+        # Using IDs from your URL: https://app.roboflow.com/onion-project/onion-tydja/9
         project = rf.workspace("onion-project").project("onion-tydja")
-        model = project.version(6).model
+        model = project.version(9).model
         return model, None
     except Exception as e:
         return None, str(e)
@@ -57,16 +58,17 @@ def determine_grade(diameter_mm):
     return "Oversized"
 
 def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm):
-    """Detects onions and uses the 'referance' object for scale."""
+    """Detects onions and uses the 'referance' object for auto-calibration."""
     try:
         cv2.imwrite("temp_inference.jpg", image_bgr)
+        # Confidence is 0-100 for this SDK method
         response = model.predict("temp_inference.jpg", confidence=conf_threshold).json()
         predictions = response.get('predictions', [])
 
-        # --- 1. DYNAMIC CALIBRATION ---
+        # --- 1. SEARCH FOR REFERENCE OBJECT ---
         calculated_ppm = None
         for p in predictions:
-            # Matches your spelling: 'referance'
+            # Matches your specific spelling from training: 'referance'
             if p['class'].lower() == 'referance':
                 pixel_size = max(p['width'], p['height'])
                 calculated_ppm = pixel_size / ref_size_mm
@@ -77,9 +79,9 @@ def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm):
         if calculated_ppm:
             st.success(f"🎯 Auto-Calibrated Scale: {final_ppm:.2f} px/mm")
         else:
-            st.info("ℹ️ 'referance' object not detected. Using fallback scale.")
+            st.warning("⚠️ 'referance' object not detected in this image. Using fallback scale.")
 
-        # --- 2. IMAGE PROCESSING ---
+        # --- 2. ANNOTATE IMAGE ---
         processed_image = image_bgr.copy()
         onion_data = []
 
@@ -89,13 +91,13 @@ def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm):
             x2, y2 = int(x_c + w_px/2), int(y_c + h_px/2)
 
             if p['class'].lower() == 'referance':
-                # Draw the reference object in Cyan
+                # Draw the calibration marker in Cyan
                 cv2.rectangle(processed_image, (x1, y1), (x2, y2), (255, 255, 0), 3)
                 cv2.putText(processed_image, "REF", (x1, y1-10), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                 continue
 
-            # Calculate Diameter for Onions
+            # Calculate Diameter
             diameter_mm = max(w_px, h_px) / final_ppm
             grade = determine_grade(diameter_mm)
             color = GRADE_COLORS.get(grade, (255, 255, 255))
@@ -118,11 +120,10 @@ def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm):
 
 def main():
     st.set_page_config(page_title="AgriGrade AI", layout="wide")
-    st.title("🧅 Onion Grading System (Auto-Calibration)")
+    st.title("🧅 Onion Grading System (Version 9)")
     
-    st.sidebar.header("⚙️ Settings")
+    st.sidebar.header("⚙️ Calibration")
     
-    # Selection for the physical object placed in the photo
     ref_type = st.sidebar.selectbox("Reference Object Used", ["25mm Coin", "85mm Card", "Custom"])
     if ref_type == "25mm Coin": ref_size_mm = 25.0
     elif ref_type == "85mm Card": ref_size_mm = 85.6
@@ -136,31 +137,31 @@ def main():
         st.error(f"API Error: {err}")
         st.stop()
 
-    uploaded_file = st.file_uploader("Upload Image", type=['jpg', 'jpeg', 'png'])
+    uploaded_file = st.file_uploader("Upload Stock Image", type=['jpg', 'jpeg', 'png'])
     
     if uploaded_file:
         image_pil = Image.open(uploaded_file)
         image_pil = correct_orientation(image_pil)
         img_bgr = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
 
-        with st.spinner("Analyzing produce..."):
+        with st.spinner("Calculating sizes..."):
             processed_img, data = process_onions(model, img_bgr, manual_ppm, conf, ref_size_mm)
             
             col1, col2 = st.columns(2)
             col1.image(image_pil, caption="Original", use_container_width=True)
             col2.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), 
-                       caption=f"Analysis Complete ({len(data)} onions)", use_container_width=True)
+                       caption="Processed Results", use_container_width=True)
 
         if data:
             df = pd.DataFrame(data)
             st.divider()
             m1, m2, m3 = st.columns(3)
-            m1.metric("Total Count", len(df))
-            m2.metric("Avg Diameter", f"{df['Diameter (mm)'].mean():.1f} mm")
+            m1.metric("Sample Count", len(df))
+            m2.metric("Mean Diameter", f"{df['Diameter (mm)'].mean():.1f} mm")
             m3.metric("Dominant Grade", df['Grade'].mode()[0])
             st.dataframe(df, use_container_width=True)
             csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button("Download CSV Report", csv, "onion_report.csv")
+            st.download_button("Download CSV Report", csv, "onion_grading_report.csv")
 
     gc.collect()
 
