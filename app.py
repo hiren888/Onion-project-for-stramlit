@@ -7,7 +7,6 @@ from roboflow import Roboflow
 import gc
 
 # --- CONFIGURATION ---
-# Grading Standards: >65mm, 55-65mm, and <55mm
 GRADE_STANDARDS = {
     "Grade A (>65mm)": (65.0, 1000.0),
     "Grade B (55-65mm)": (55.0, 65.0), 
@@ -20,14 +19,17 @@ GRADE_COLORS = {
     "Grade C (<55mm)": (0, 0, 255)      # Red
 }
 
+# --- SESSION STATE INITIALIZATION ---
+if 'master_data' not in st.session_state:
+    st.session_state['master_data'] = pd.DataFrame(columns=["Batch ID", "Diameter (mm)", "Grade"])
+if 'batch_counter' not in st.session_state:
+    st.session_state['batch_counter'] = 0
+
 @st.cache_resource
 def load_model():
-    """Initializes the Roboflow API Client for Version 11."""
     api_key = st.secrets.get("ROBOFLOW_API_KEY", "YOUR_API_KEY_HERE")
     try:
         rf = Roboflow(api_key=api_key)
-        # NOTE: Verify your workspace name. Based on your previous code it was "onion-project".
-        # If the link implies the workspace is literally named "project", change it below.
         project = rf.workspace("onion-project").project("onion-tydja")
         model = project.version(11).model
         return model, None
@@ -35,7 +37,6 @@ def load_model():
         return None, str(e)
 
 def correct_orientation(image):
-    """Corrects image rotation for mobile uploads."""
     try:
         for orientation in ExifTags.TAGS.keys():
             if ExifTags.TAGS[orientation] == 'Orientation':
@@ -57,74 +58,54 @@ def determine_grade(diameter_mm):
     return "Unknown"
 
 def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm):
-    """Detects onions and uses the 'Reference' object for auto-calibration."""
     try:
-        # Save temp image for API inference
         cv2.imwrite("temp_inference.jpg", image_bgr)
         response = model.predict("temp_inference.jpg", confidence=conf_threshold).json()
         predictions = response.get('predictions', [])
 
-        # --- 1. DYNAMIC CALIBRATION ---
+        # Calibration
         calculated_ppm = None
         for p in predictions:
-            # Check for reference class (case-insensitive)
-            c_name = p['class'].lower()
-            if 'refer' in c_name: # Matches 'reference', 'referance', etc.
+            if 'refer' in p['class'].lower():
                 pixel_size = max(p['width'], p['height'])
                 calculated_ppm = pixel_size / ref_size_mm
                 break 
-
         final_ppm = calculated_ppm if calculated_ppm else manual_ppm
         
-        if calculated_ppm:
-            st.success(f"🎯 Auto-Calibrated Scale: {final_ppm:.2f} px/mm")
-        else:
-            st.warning("⚠️ Reference object not detected. Using fallback scale.")
-
-        # --- 2. PROCESSING ---
         processed_image = image_bgr.copy()
-        onion_data = []
+        current_batch_data = []
 
-        for i, p in enumerate(predictions):
+        for p in predictions:
+            if 'refer' in p['class'].lower():
+                continue
+
             x_c, y_c, w_px, h_px = p['x'], p['y'], p['width'], p['height']
             x1, y1 = int(x_c - w_px/2), int(y_c - h_px/2)
             x2, y2 = int(x_c + w_px/2), int(y_c + h_px/2)
 
-            # Draw Reference Box (Yellow)
-            if 'refer' in p['class'].lower():
-                cv2.rectangle(processed_image, (x1, y1), (x2, y2), (255, 255, 0), 3)
-                cv2.putText(processed_image, "REF", (x1, y1-10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                continue
-
-            # Calculate Diameter & Grade
             diameter_mm = max(w_px, h_px) / final_ppm
             grade = determine_grade(diameter_mm)
             color = GRADE_COLORS.get(grade, (255, 255, 255))
             
-            # Draw Onion Box
             cv2.rectangle(processed_image, (x1, y1), (x2, y2), color, 4)
             cv2.putText(processed_image, f"{diameter_mm:.1f}mm", (x1, y1-10), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-            onion_data.append({
-                "ID": i + 1,
+            current_batch_data.append({
                 "Diameter (mm)": round(diameter_mm, 2),
                 "Grade": grade
             })
             
-        return processed_image, onion_data
+        return processed_image, current_batch_data, final_ppm
     except Exception as e:
-        st.error(f"Inference Error: {e}")
-        return image_bgr, []
+        return image_bgr, [], manual_ppm
 
 def main():
-    st.set_page_config(page_title="AgriGrade AI", layout="wide")
-    st.title("🧅 Onion Grading System (v11)")
+    st.set_page_config(page_title="AgriGrade Procurement", layout="wide")
+    st.title("🧅 Onion Procurement System")
     
-    st.sidebar.header("⚙️ Settings")
-    
-    # Reference Object Selector
+    # --- SIDEBAR SETTINGS ---
+    st.sidebar.header("⚙️ Configuration")
     ref_type = st.sidebar.selectbox("Reference Object", ["25mm Coin", "85mm Card", "Custom"])
     if ref_type == "25mm Coin": ref_size_mm = 25.0
     elif ref_type == "85mm Card": ref_size_mm = 85.6
@@ -133,59 +114,100 @@ def main():
     manual_ppm = st.sidebar.number_input("Fallback Scale (px/mm)", 0.1, 100.0, 5.0)
     conf = st.sidebar.slider("AI Confidence %", 10, 100, 40)
     
-    # Load Model
+    # Add Reset Button to Sidebar
+    if st.sidebar.button("🗑️ Clear All Data"):
+        st.session_state['master_data'] = pd.DataFrame(columns=["Batch ID", "Diameter (mm)", "Grade"])
+        st.session_state['batch_counter'] = 0
+        st.rerun()
+
     model, err = load_model()
     if err:
         st.error(f"API Error: {err}")
         st.stop()
 
-    uploaded_file = st.file_uploader("Upload Image", type=['jpg', 'jpeg', 'png'])
+    # --- MAIN INTERFACE ---
+    col_upload, col_stats = st.columns([1, 1])
     
-    if uploaded_file:
-        image_pil = Image.open(uploaded_file)
-        image_pil = correct_orientation(image_pil)
-        img_bgr = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
-
-        with st.spinner("Analyzing produce..."):
-            processed_img, data = process_onions(model, img_bgr, manual_ppm, conf, ref_size_mm)
+    with col_upload:
+        st.subheader("1. Detect & Verify")
+        uploaded_file = st.file_uploader("Upload Image", type=['jpg', 'jpeg', 'png'])
+        
+        if uploaded_file:
+            image_pil = Image.open(uploaded_file)
+            image_pil = correct_orientation(image_pil)
+            img_bgr = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
             
-            # Display Images
-            col1, col2 = st.columns(2)
-            col1.image(image_pil, caption="Original", use_container_width=True)
-            col2.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), caption="Analysis", use_container_width=True)
+            # Process Image
+            processed_img, current_data, used_ppm = process_onions(model, img_bgr, manual_ppm, conf, ref_size_mm)
+            
+            st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), caption=f"Analyzed (Scale: {used_ppm:.2f})", use_container_width=True)
+            
+            # "Add to Batch" Logic
+            if current_data:
+                st.info(f"Detected {len(current_data)} onions in this image.")
+                if st.button("✅ Add these to Report"):
+                    # Create DF for current batch
+                    batch_df = pd.DataFrame(current_data)
+                    batch_df["Batch ID"] = st.session_state['batch_counter'] + 1
+                    
+                    # Append to Master DF
+                    st.session_state['master_data'] = pd.concat([st.session_state['master_data'], batch_df], ignore_index=True)
+                    st.session_state['batch_counter'] += 1
+                    st.success(f"Added Batch #{st.session_state['batch_counter']} to report!")
+                    st.rerun()
 
-        if data:
-            df = pd.DataFrame(data)
+    with col_stats:
+        st.subheader("2. Cumulative Report")
+        master_df = st.session_state['master_data']
+        
+        if not master_df.empty:
+            total_onions = len(master_df)
+            
+            # Top Metrics
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Onions", total_onions)
+            m2.metric("Batches Processed", st.session_state['batch_counter'])
+            m3.metric("Avg Diameter", f"{master_df['Diameter (mm)'].mean():.1f} mm")
+            
             st.divider()
             
-            # KPI Metrics
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Total Count", len(df))
-            m2.metric("Avg Diameter", f"{df['Diameter (mm)'].mean():.1f} mm")
-            try:
-                dominant_grade = df['Grade'].mode()[0]
-            except:
-                dominant_grade = "N/A"
-            m3.metric("Dominant Grade", dominant_grade)
-
-            # Distribution Chart
-            st.subheader("📊 Stock Distribution")
+            # --- PERCENTAGE CALCULATION ---
+            st.markdown("### 📊 Grade Breakdown")
             
-            # Ensure all grades are represented even if count is 0
-            grade_counts = df['Grade'].value_counts()
-            for grade in GRADE_STANDARDS.keys():
-                if grade not in grade_counts:
-                    grade_counts[grade] = 0
+            # Get counts for all grades (including 0 if missing)
+            grade_counts = master_df['Grade'].value_counts()
+            for g in GRADE_STANDARDS.keys():
+                if g not in grade_counts: grade_counts[g] = 0
             
-            # Sort explicitly by Grade A -> B -> C
+            # Sort grades
             grade_counts = grade_counts.reindex(list(GRADE_STANDARDS.keys()))
             
-            st.bar_chart(grade_counts)
+            # Create a nice summary table with Percentages
+            summary_data = []
+            for grade, count in grade_counts.items():
+                percentage = (count / total_onions) * 100 if total_onions > 0 else 0
+                summary_data.append({
+                    "Grade": grade,
+                    "Count": count,
+                    "Percentage": f"{percentage:.1f}%"
+                })
             
-            # Data Table & Download
-            st.dataframe(df, use_container_width=True)
-            csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button("Download CSV", csv, "onion_report.csv")
+            st.dataframe(pd.DataFrame(summary_data), use_container_width=True, hide_index=True)
+            
+            # Visualization
+            st.bar_chart(grade_counts)
+
+            # --- DOWNLOAD BUTTON ---
+            csv = master_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download Cumulative Report (CSV)",
+                data=csv,
+                file_name="onion_procurement_report.csv",
+                mime="text/csv",
+                type="primary"
+            )
+        else:
+            st.info("No data yet. Upload an image and click 'Add to Report' to build your stats.")
 
     gc.collect()
 
