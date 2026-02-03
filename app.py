@@ -61,20 +61,17 @@ def determine_grade(diameter_mm):
             return grade
     return "Unknown"
 
-def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm):
+def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm, correction_factor):
     try:
         cv2.imwrite("temp_inference.jpg", image_bgr)
         
-        # 1. FIX: Request ALL detections (confidence=10) to ensure we catch the Reference object
-        # We will filter the onions manually later based on the user's slider.
+        # 1. Request ALL detections to catch the Reference object
         response = model.predict("temp_inference.jpg", confidence=10).json()
         raw_predictions = response.get('predictions', [])
 
         # --- 2. DYNAMIC CALIBRATION ---
         calculated_ppm = None
         reference_prediction = None
-        
-        # Broad list of possible names for the reference object
         target_names = ['reference', 'ref', 'coin', 'card', 'marker', 'calibration']
         
         for p in raw_predictions:
@@ -82,7 +79,7 @@ def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm):
             if any(name in c_name for name in target_names):
                 pixel_size = max(p['width'], p['height'])
                 calculated_ppm = pixel_size / ref_size_mm
-                reference_prediction = p # Save to draw later
+                reference_prediction = p
                 break 
 
         final_ppm = calculated_ppm if calculated_ppm else manual_ppm
@@ -101,30 +98,27 @@ def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm):
             cv2.putText(processed_image, "REF", (x1, y1-10), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
-        # Process Onions (Filter by User's Confidence Slider)
+        # Process Onions
         user_conf_decimal = conf_threshold / 100.0
         
         for p in raw_predictions:
-            # Skip the reference object we already handled
-            if p == reference_prediction:
-                continue
-            
-            # Skip low-confidence onions based on user slider
-            if p['confidence'] < user_conf_decimal:
-                continue
+            if p == reference_prediction: continue
+            if p['confidence'] < user_conf_decimal: continue
 
-            # Coordinates
             x_c, y_c, w_px, h_px = p['x'], p['y'], p['width'], p['height']
             x1, y1 = int(x_c - w_px/2), int(y_c - h_px/2)
             x2, y2 = int(x_c + w_px/2), int(y_c + h_px/2)
 
-            # Calculation
-            diameter_mm = max(w_px, h_px) / final_ppm
+            # Calculation with CORRECTION FACTOR
+            raw_diameter = max(w_px, h_px) / final_ppm
+            diameter_mm = raw_diameter * correction_factor
+            
             grade = determine_grade(diameter_mm)
             color = GRADE_COLORS.get(grade, (255, 255, 255))
             
             # Draw
             cv2.rectangle(processed_image, (x1, y1), (x2, y2), color, 4)
+            # Show diameter
             cv2.putText(processed_image, f"{diameter_mm:.1f}mm", (x1, y1-10), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
@@ -151,10 +145,24 @@ def main():
     elif ref_type == "85mm Card": ref_size_mm = 85.6
     else: ref_size_mm = st.sidebar.number_input("Custom Size (mm)", 1.0, 500.0, 50.0)
 
+    # Tuning Tools
+    st.sidebar.divider()
+    st.sidebar.subheader("🔧 Fine-Tuning")
     manual_ppm = st.sidebar.number_input("Fallback Scale (px/mm)", 0.1, 100.0, 5.0)
     conf = st.sidebar.slider("AI Confidence %", 10, 100, 40)
     
+    # NEW: Calibration Factor
+    correction_factor = st.sidebar.number_input(
+        "Size Correction Factor", 
+        min_value=0.8, 
+        max_value=1.2, 
+        value=1.0, 
+        step=0.01,
+        help="1.0 = No change. 0.95 = Reduce size by 5%. 1.05 = Increase size by 5%."
+    )
+    
     # Reset Button
+    st.sidebar.divider()
     if st.sidebar.button("🗑️ Clear All Data"):
         st.session_state['master_data'] = pd.DataFrame(columns=["Batch ID", "Diameter (mm)", "Grade"])
         st.session_state['batch_counter'] = 0
@@ -177,11 +185,10 @@ def main():
             image_pil = correct_orientation(image_pil)
             img_bgr = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
             
-            # Process Image
-            processed_img, current_data, used_ppm = process_onions(model, img_bgr, manual_ppm, conf, ref_size_mm)
+            # Process Image with Correction Factor
+            processed_img, current_data, used_ppm = process_onions(model, img_bgr, manual_ppm, conf, ref_size_mm, correction_factor)
             
-            # Display Result
-            st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), caption=f"Analyzed (Scale: {used_ppm:.2f})", use_container_width=True)
+            st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), caption=f"Analyzed (Scale: {used_ppm:.2f} | Correction: {correction_factor})", use_container_width=True)
             
             # "Add to Batch" Logic
             if current_data:
@@ -213,15 +220,12 @@ def main():
             # --- PERCENTAGE BREAKDOWN TABLE ---
             st.markdown("### 📊 Grade Breakdown")
             
-            # Get counts including zeros
             grade_counts = master_df['Grade'].value_counts()
             for g in GRADE_STANDARDS.keys():
                 if g not in grade_counts: grade_counts[g] = 0
             
-            # Sort A -> B -> C
             grade_counts = grade_counts.reindex(list(GRADE_STANDARDS.keys()))
             
-            # Create Display Data
             summary_data = []
             for grade, count in grade_counts.items():
                 pct = (count / total_onions) * 100 if total_onions > 0 else 0
@@ -233,7 +237,6 @@ def main():
             
             st.dataframe(pd.DataFrame(summary_data), use_container_width=True, hide_index=True)
             
-            # Bar Chart
             st.bar_chart(grade_counts)
 
             # --- DOWNLOAD BUTTON ---
