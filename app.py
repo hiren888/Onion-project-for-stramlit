@@ -7,21 +7,18 @@ from roboflow import Roboflow
 import gc
 
 # --- CONFIGURATION ---
-# Grading Standards
 GRADE_STANDARDS = {
     "Grade A (>65mm)": (65.0, 1000.0),
     "Grade B (55-65mm)": (55.0, 65.0), 
     "Grade C (<55mm)": (0.0, 55.0)
 }
 
-# Visualization Colors
 GRADE_COLORS = {
     "Grade A (>65mm)": (0, 255, 0),     # Green
     "Grade B (55-65mm)": (255, 165, 0), # Orange
     "Grade C (<55mm)": (0, 0, 255)      # Red
 }
 
-# --- SESSION STATE INITIALIZATION ---
 if 'master_data' not in st.session_state:
     st.session_state['master_data'] = pd.DataFrame(columns=["Batch ID", "Diameter (mm)", "Grade"])
 if 'batch_counter' not in st.session_state:
@@ -29,8 +26,8 @@ if 'batch_counter' not in st.session_state:
 
 @st.cache_resource
 def load_model():
-    """Initializes the Roboflow API Client for Version 11."""
-    api_key = st.secrets.get("ROBOFLOW_API_KEY", "YOUR_API_KEY_HERE")
+    # Attempt to load secret; default to empty if not found (will error later safely)
+    api_key = st.secrets.get("ROBOFLOW_API_KEY", "")
     try:
         rf = Roboflow(api_key=api_key)
         project = rf.workspace("onion-project").project("onion-tydja")
@@ -40,43 +37,40 @@ def load_model():
         return None, str(e)
 
 def correct_orientation(image):
-    """Corrects image rotation for mobile uploads."""
     try:
         for orientation in ExifTags.TAGS.keys():
-            if ExifTags.TAGS[orientation] == 'Orientation':
-                break
+            if ExifTags.TAGS[orientation] == 'Orientation': break
         exif = image._getexif()
         if exif is not None:
             orientation = exif.get(orientation)
             if orientation == 3: image = image.rotate(180, expand=True)
             elif orientation == 6: image = image.rotate(270, expand=True)
             elif orientation == 8: image = image.rotate(90, expand=True)
-    except:
-        pass
+    except: pass
     return image
 
 def determine_grade(diameter_mm):
     for grade, (min_d, max_d) in GRADE_STANDARDS.items():
-        if min_d <= diameter_mm < max_d:
-            return grade
+        if min_d <= diameter_mm < max_d: return grade
     return "Unknown"
 
-def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm, correction_factor):
+def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm, camera_height_cm, ignore_edges):
     try:
+        img_h, img_w = image_bgr.shape[:2]
+        edge_margin = 25 # Slightly increased margin for safety
+
         cv2.imwrite("temp_inference.jpg", image_bgr)
-        
-        # 1. Request ALL detections to catch the Reference object
+        # Low confidence to catch reference
         response = model.predict("temp_inference.jpg", confidence=10).json()
         raw_predictions = response.get('predictions', [])
 
-        # --- 2. DYNAMIC CALIBRATION ---
+        # --- CALIBRATION ---
         calculated_ppm = None
         reference_prediction = None
-        target_names = ['reference', 'ref', 'coin', 'card', 'marker', 'calibration']
+        target_names = ['reference', 'ref', 'coin', 'card', 'marker']
         
         for p in raw_predictions:
-            c_name = p['class'].lower()
-            if any(name in c_name for name in target_names):
+            if any(name in p['class'].lower() for name in target_names):
                 pixel_size = max(p['width'], p['height'])
                 calculated_ppm = pixel_size / ref_size_mm
                 reference_prediction = p
@@ -84,23 +78,21 @@ def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm, co
 
         final_ppm = calculated_ppm if calculated_ppm else manual_ppm
         
-        # --- 3. PROCESSING & FILTERING ---
+        # --- PROCESSING ---
         processed_image = image_bgr.copy()
         current_batch_data = []
 
-        # Draw the Reference Box (if found)
+        # Draw Reference Box
         if reference_prediction:
             p = reference_prediction
-            x_c, y_c, w_px, h_px = p['x'], p['y'], p['width'], p['height']
-            x1, y1 = int(x_c - w_px/2), int(y_c - h_px/2)
-            x2, y2 = int(x_c + w_px/2), int(y_c + h_px/2)
+            x1, y1 = int(p['x'] - p['width']/2), int(p['y'] - p['height']/2)
+            x2, y2 = int(p['x'] + p['width']/2), int(p['y'] + p['height']/2)
             cv2.rectangle(processed_image, (x1, y1), (x2, y2), (255, 255, 0), 3)
-            cv2.putText(processed_image, "REF", (x1, y1-10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            cv2.putText(processed_image, "REF", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
-        # Process Onions
         user_conf_decimal = conf_threshold / 100.0
-        
+        cam_h_mm = camera_height_cm * 10.0
+
         for p in raw_predictions:
             if p == reference_prediction: continue
             if p['confidence'] < user_conf_decimal: continue
@@ -109,147 +101,120 @@ def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm, co
             x1, y1 = int(x_c - w_px/2), int(y_c - h_px/2)
             x2, y2 = int(x_c + w_px/2), int(y_c + h_px/2)
 
-            # Calculation with CORRECTION FACTOR
-            raw_diameter = max(w_px, h_px) / final_ppm
-            diameter_mm = raw_diameter * correction_factor
+            # Edge Filter
+            if ignore_edges:
+                if x1 < edge_margin or y1 < edge_margin or x2 > (img_w - edge_margin) or y2 > (img_h - edge_margin):
+                    continue 
+
+            # --- GEOMETRIC SIZE CORRECTION ---
+            # 1. Raw Size (Floor level)
+            raw_diameter_mm = max(w_px, h_px) / final_ppm
             
-            grade = determine_grade(diameter_mm)
+            # 2. Correction
+            # Estimate radius (height of the onion surface from floor)
+            estimated_radius = raw_diameter_mm / 2.0
+            
+            # Factor = (Camera_Height - Onion_Height) / Camera_Height
+            if cam_h_mm > 0:
+                correction_factor = (cam_h_mm - estimated_radius) / cam_h_mm
+            else:
+                correction_factor = 1.0
+            
+            final_diameter_mm = raw_diameter_mm * correction_factor
+            
+            grade = determine_grade(final_diameter_mm)
             color = GRADE_COLORS.get(grade, (255, 255, 255))
             
-            # Draw
             cv2.rectangle(processed_image, (x1, y1), (x2, y2), color, 4)
-            # Show diameter
-            cv2.putText(processed_image, f"{diameter_mm:.1f}mm", (x1, y1-10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            cv2.putText(processed_image, f"{final_diameter_mm:.1f}mm", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-            current_batch_data.append({
-                "Diameter (mm)": round(diameter_mm, 2),
-                "Grade": grade
-            })
+            current_batch_data.append({"Diameter (mm)": round(final_diameter_mm, 2), "Grade": grade})
             
         return processed_image, current_batch_data, final_ppm
     except Exception as e:
-        st.error(f"Processing Error: {e}")
+        st.error(f"Error: {e}")
         return image_bgr, [], manual_ppm
 
 def main():
     st.set_page_config(page_title="AgriGrade Procurement", layout="wide")
     st.title("🧅 Onion Procurement System")
     
-    # --- SIDEBAR SETTINGS ---
+    # --- SIDEBAR ---
     st.sidebar.header("⚙️ Configuration")
-    
-    # Reference Settings
     ref_type = st.sidebar.selectbox("Reference Object", ["25mm Coin", "85mm Card", "Custom"])
-    if ref_type == "25mm Coin": ref_size_mm = 25.0
-    elif ref_type == "85mm Card": ref_size_mm = 85.6
-    else: ref_size_mm = st.sidebar.number_input("Custom Size (mm)", 1.0, 500.0, 50.0)
+    ref_size_mm = 25.0 if ref_type == "25mm Coin" else 85.6 if ref_type == "85mm Card" else st.sidebar.number_input("Custom (mm)", 1.0, 500.0, 50.0)
 
-    # Tuning Tools
     st.sidebar.divider()
-    st.sidebar.subheader("🔧 Fine-Tuning")
-    manual_ppm = st.sidebar.number_input("Fallback Scale (px/mm)", 0.1, 100.0, 5.0)
+    st.sidebar.subheader("📐 Capture Conditions")
+    
+    # NEW: Simplified Stance Selector
+    stance = st.sidebar.radio("Photographer Stance", ["Standing (Standard)", "Sitting/Table", "Custom"], index=0)
+    
+    if stance == "Standing (Standard)":
+        camera_height_cm = 120  # Safe average for standing
+        st.sidebar.caption("Using default height: 120cm")
+    elif stance == "Sitting/Table":
+        camera_height_cm = 60   # Safe average for sitting at a table
+        st.sidebar.caption("Using default height: 60cm")
+    else:
+        camera_height_cm = st.sidebar.number_input("Custom Height (cm)", 30, 200, 120)
+
+    ignore_edges = st.sidebar.checkbox("Ignore Edge Onions", value=True, help="Removes partial onions at borders.")
     conf = st.sidebar.slider("AI Confidence %", 10, 100, 40)
-    
-    # NEW: Calibration Factor
-    correction_factor = st.sidebar.number_input(
-        "Size Correction Factor", 
-        min_value=0.8, 
-        max_value=1.2, 
-        value=1.0, 
-        step=0.01,
-        help="1.0 = No change. 0.95 = Reduce size by 5%. 1.05 = Increase size by 5%."
-    )
-    
-    # Reset Button
-    st.sidebar.divider()
-    if st.sidebar.button("🗑️ Clear All Data"):
+    manual_ppm = st.sidebar.number_input("Fallback Scale", 0.1, 100.0, 5.0)
+
+    if st.sidebar.button("🗑️ Clear Data"):
         st.session_state['master_data'] = pd.DataFrame(columns=["Batch ID", "Diameter (mm)", "Grade"])
         st.session_state['batch_counter'] = 0
         st.rerun()
 
     model, err = load_model()
-    if err:
-        st.error(f"API Error: {err}")
+    if err: 
+        st.error(f"API Error: {err}. Please check your API Key in Secrets.")
         st.stop()
 
-    # --- MAIN INTERFACE ---
-    col_upload, col_stats = st.columns([1, 1])
+    # --- MAIN ---
+    col1, col2 = st.columns([1, 1])
     
-    with col_upload:
+    with col1:
         st.subheader("1. Detect & Verify")
         uploaded_file = st.file_uploader("Upload Image", type=['jpg', 'jpeg', 'png'])
-        
         if uploaded_file:
-            image_pil = Image.open(uploaded_file)
-            image_pil = correct_orientation(image_pil)
-            img_bgr = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
+            img = Image.open(uploaded_file)
+            img = correct_orientation(img)
+            img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
             
-            # Process Image with Correction Factor
-            processed_img, current_data, used_ppm = process_onions(model, img_bgr, manual_ppm, conf, ref_size_mm, correction_factor)
+            processed, data, ppm = process_onions(model, img_bgr, manual_ppm, conf, ref_size_mm, camera_height_cm, ignore_edges)
             
-            st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), caption=f"Analyzed (Scale: {used_ppm:.2f} | Correction: {correction_factor})", use_container_width=True)
+            st.image(cv2.cvtColor(processed, cv2.COLOR_BGR2RGB), caption=f"Analyzed (Stance: {stance} | H: {camera_height_cm}cm)", use_container_width=True)
             
-            # "Add to Batch" Logic
-            if current_data:
-                st.info(f"Detected {len(current_data)} onions.")
-                if st.button("✅ Add these to Report", key="add_btn"):
-                    batch_df = pd.DataFrame(current_data)
-                    batch_df["Batch ID"] = st.session_state['batch_counter'] + 1
-                    
-                    st.session_state['master_data'] = pd.concat([st.session_state['master_data'], batch_df], ignore_index=True)
-                    st.session_state['batch_counter'] += 1
-                    st.success(f"Added Batch #{st.session_state['batch_counter']} to report!")
-                    st.rerun()
+            if data and st.button("✅ Add to Report"):
+                batch = pd.DataFrame(data)
+                batch["Batch ID"] = st.session_state['batch_counter'] + 1
+                st.session_state['master_data'] = pd.concat([st.session_state['master_data'], batch], ignore_index=True)
+                st.session_state['batch_counter'] += 1
+                st.success("Batch Added!"); st.rerun()
 
-    with col_stats:
+    with col2:
         st.subheader("2. Cumulative Report")
-        master_df = st.session_state['master_data']
-        
-        if not master_df.empty:
-            total_onions = len(master_df)
-            
-            # Top Metrics
+        df = st.session_state['master_data']
+        if not df.empty:
             m1, m2, m3 = st.columns(3)
-            m1.metric("Total Onions", total_onions)
+            m1.metric("Count", len(df))
             m2.metric("Batches", st.session_state['batch_counter'])
-            m3.metric("Avg Size", f"{master_df['Diameter (mm)'].mean():.1f} mm")
+            m3.metric("Avg Size", f"{df['Diameter (mm)'].mean():.1f} mm")
             
-            st.divider()
-            
-            # --- PERCENTAGE BREAKDOWN TABLE ---
             st.markdown("### 📊 Grade Breakdown")
+            counts = df['Grade'].value_counts()
+            for g in GRADE_STANDARDS: 
+                if g not in counts: counts[g] = 0
+            counts = counts.reindex(list(GRADE_STANDARDS.keys()))
             
-            grade_counts = master_df['Grade'].value_counts()
-            for g in GRADE_STANDARDS.keys():
-                if g not in grade_counts: grade_counts[g] = 0
+            summary = [{"Grade": g, "Count": c, "%": f"{(c/len(df)*100):.1f}%"} for g, c in counts.items()]
+            st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
+            st.bar_chart(counts)
             
-            grade_counts = grade_counts.reindex(list(GRADE_STANDARDS.keys()))
-            
-            summary_data = []
-            for grade, count in grade_counts.items():
-                pct = (count / total_onions) * 100 if total_onions > 0 else 0
-                summary_data.append({
-                    "Grade Category": grade,
-                    "Count": count,
-                    "Percentage": f"{pct:.1f}%"
-                })
-            
-            st.dataframe(pd.DataFrame(summary_data), use_container_width=True, hide_index=True)
-            
-            st.bar_chart(grade_counts)
-
-            # --- DOWNLOAD BUTTON ---
-            csv = master_df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Download Full Report (CSV)",
-                data=csv,
-                file_name="onion_procurement_report.csv",
-                mime="text/csv",
-                type="primary"
-            )
-        else:
-            st.info("Upload an image and click 'Add to Report' to see cumulative statistics.")
+            st.download_button("📥 Download CSV", df.to_csv(index=False).encode('utf-8'), "onion_report.csv", "text/csv", type="primary")
 
     gc.collect()
 
