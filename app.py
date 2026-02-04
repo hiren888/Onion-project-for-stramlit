@@ -53,6 +53,23 @@ def determine_grade(diameter_mm):
         if min_d <= diameter_mm < max_d: return grade
     return "Unknown"
 
+def get_reference_score(class_name):
+    """
+    Assigns a priority score to class names.
+    Higher score = Higher priority, regardless of confidence.
+    """
+    cn = class_name.lower()
+    # PRIORITY 1: The exact name you used in training
+    if cn == 'reference': 
+        return 100
+    # PRIORITY 2: Common typos found in your logs
+    if cn == 'referance': 
+        return 50
+    # PRIORITY 3: Fallbacks
+    if any(x in cn for x in ['coin', 'card', 'ref', 'scale']): 
+        return 10
+    return 0
+
 def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm, camera_height_cm, ignore_edges, debug_mode):
     try:
         img_h, img_w = image_bgr.shape[:2]
@@ -60,55 +77,79 @@ def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm, ca
 
         cv2.imwrite("temp_inference.jpg", image_bgr)
         
-        # EXTREMELY LOW Confidence (1%) to find everything
+        # 1. Get ALL predictions (Confidence > 1%)
         response = model.predict("temp_inference.jpg", confidence=1).json()
         raw_predictions = response.get('predictions', [])
 
-        # --- DEBUG PRINT ---
         if debug_mode:
-            st.warning("🕵️ DEBUG: Raw Detections from AI")
+            st.warning("🕵️ DEBUG: Raw Detections List")
             debug_list = [f"{p['class']} ({p['confidence']:.2f})" for p in raw_predictions]
             st.write(debug_list)
 
-        # --- CALIBRATION ---
+        # --- 2. FIND THE BEST REFERENCE (NEW SORTING LOGIC) ---
         calculated_ppm = None
         reference_prediction = None
-        # Expanded list of possible names
-        target_names = ['reference', 'ref', 'coin', 'card', 'marker', 'scale', 'token', 'calibration']
+        
+        candidate_refs = []
+        target_names = ['reference', 'referance', 'ref', 'coin', 'card', 'marker', 'scale', 'token', 'calibration']
         
         for p in raw_predictions:
             if any(name in p['class'].lower() for name in target_names):
-                pixel_size = max(p['width'], p['height'])
-                calculated_ppm = pixel_size / ref_size_mm
-                reference_prediction = p
-                if debug_mode: st.success(f"✅ FOUND REFERENCE: {p['class']}")
-                break 
+                candidate_refs.append(p)
+
+        # SORTING MAGIC:
+        # Sort first by Name Priority (Score), THEN by Confidence
+        # This forces 'Reference' (Score 100) to beat 'referance' (Score 50) even if confidence is lower.
+        candidate_refs.sort(key=lambda x: (get_reference_score(x['class']), x['confidence']), reverse=True)
+
+        if candidate_refs:
+            # Pick the winner
+            reference_prediction = candidate_refs[0]
+            pixel_size = max(reference_prediction['width'], reference_prediction['height'])
+            calculated_ppm = pixel_size / ref_size_mm
+            
+            if debug_mode: 
+                st.success(f"✅ SELECTED REFERENCE: '{reference_prediction['class']}' (Score: {get_reference_score(reference_prediction['class'])}, Conf: {reference_prediction['confidence']:.2f})")
 
         final_ppm = calculated_ppm if calculated_ppm else manual_ppm
         
-        # --- PROCESSING ---
+        # --- 3. PROCESSING & DRAWING ---
         processed_image = image_bgr.copy()
         current_batch_data = []
 
-        # Draw Reference Box
+        # Draw Candidate References (Cyan) - Debug Only
+        if debug_mode:
+            for cand in candidate_refs:
+                if cand == reference_prediction: continue
+                x1 = int(cand['x'] - cand['width']/2)
+                y1 = int(cand['y'] - cand['height']/2)
+                x2 = int(cand['x'] + cand['width']/2)
+                y2 = int(cand['y'] + cand['height']/2)
+                cv2.rectangle(processed_image, (x1, y1), (x2, y2), (255, 255, 0), 1) 
+                cv2.putText(processed_image, cand['class'], (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+
+        # Draw Selected Reference (Thick Yellow)
         if reference_prediction:
             p = reference_prediction
             x1, y1 = int(p['x'] - p['width']/2), int(p['y'] - p['height']/2)
             x2, y2 = int(p['x'] + p['width']/2), int(p['y'] + p['height']/2)
-            cv2.rectangle(processed_image, (x1, y1), (x2, y2), (255, 255, 0), 3)
-            cv2.putText(processed_image, "REF", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            cv2.rectangle(processed_image, (x1, y1), (x2, y2), (0, 255, 255), 3) # Yellow
+            cv2.putText(processed_image, "REF", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         elif debug_mode:
-            st.error("❌ Reference NOT found in this list.")
+            st.error("❌ No Reference object selected from candidates.")
 
+        # --- 4. MEASURE ONIONS ---
         user_conf_decimal = conf_threshold / 100.0
         cam_h_mm = camera_height_cm * 10.0
 
         for p in raw_predictions:
+            # Skip the specific reference object instance
             if p == reference_prediction: continue
-            if p['confidence'] < user_conf_decimal: continue
+            
+            # Skip other candidates (don't count the 'fake' reference as an onion)
+            if p in candidate_refs: continue
 
-            # Prevent detecting the reference as an onion if names are similar
-            if any(name in p['class'].lower() for name in target_names): continue
+            if p['confidence'] < user_conf_decimal: continue
 
             x_c, y_c, w_px, h_px = p['x'], p['y'], p['width'], p['height']
             x1, y1 = int(x_c - w_px/2), int(y_c - h_px/2)
@@ -118,7 +159,7 @@ def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm, ca
                 if x1 < edge_margin or y1 < edge_margin or x2 > (img_w - edge_margin) or y2 > (img_h - edge_margin):
                     continue 
 
-            # --- GEOMETRIC SIZE CORRECTION ---
+            # Geometric Correction
             raw_diameter_mm = max(w_px, h_px) / final_ppm
             estimated_radius = raw_diameter_mm / 2.0
             
@@ -166,7 +207,7 @@ def main():
         camera_height_cm = st.sidebar.number_input("Custom Height (cm)", 30, 200, 120)
 
     ignore_edges = st.sidebar.checkbox("Ignore Edge Onions", value=True)
-    debug_mode = st.sidebar.checkbox("🕵️ Show Debug Info", value=False, help="Check this to see what the AI detects")
+    debug_mode = st.sidebar.checkbox("🕵️ Show Debug Info", value=False)
 
     conf = st.sidebar.slider("AI Confidence %", 10, 100, 40)
     manual_ppm = st.sidebar.number_input("Fallback Scale", 0.1, 100.0, 5.0)
@@ -178,7 +219,7 @@ def main():
 
     model, err = load_model()
     if err: 
-        st.error(f"API Error: {err}. Please check your API Key in Secrets.")
+        st.error(f"API Error: {err}. Check Secrets.")
         st.stop()
 
     # --- MAIN ---
