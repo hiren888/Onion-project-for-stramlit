@@ -55,100 +55,67 @@ def determine_grade(diameter_mm):
 
 def get_reference_score(class_name):
     """
-    Assigns a priority score to class names.
-    Higher score = Higher priority, regardless of confidence.
+    Prioritizes correct labels over typos invisibly.
     """
     cn = class_name.lower()
-    # PRIORITY 1: The exact name you used in training
-    if cn == 'reference': 
-        return 100
-    # PRIORITY 2: Common typos found in your logs
-    if cn == 'referance': 
-        return 50
-    # PRIORITY 3: Fallbacks
-    if any(x in cn for x in ['coin', 'card', 'ref', 'scale']): 
-        return 10
+    if cn == 'reference': return 100
+    if cn == 'referance': return 50
+    if any(x in cn for x in ['coin', 'card', 'ref', 'scale']): return 10
     return 0
 
-def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm, camera_height_cm, ignore_edges, debug_mode):
+def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm, camera_height_cm, ignore_edges):
     try:
         img_h, img_w = image_bgr.shape[:2]
         edge_margin = 25 
 
         cv2.imwrite("temp_inference.jpg", image_bgr)
-        
-        # 1. Get ALL predictions (Confidence > 1%)
+        # 1. Get ALL predictions
         response = model.predict("temp_inference.jpg", confidence=1).json()
         raw_predictions = response.get('predictions', [])
 
-        if debug_mode:
-            st.warning("🕵️ DEBUG: Raw Detections List")
-            debug_list = [f"{p['class']} ({p['confidence']:.2f})" for p in raw_predictions]
-            st.write(debug_list)
-
-        # --- 2. FIND THE BEST REFERENCE (NEW SORTING LOGIC) ---
+        # --- 2. SELECT BEST REFERENCE ---
         calculated_ppm = None
         reference_prediction = None
         
-        candidate_refs = []
         target_names = ['reference', 'referance', 'ref', 'coin', 'card', 'marker', 'scale', 'token', 'calibration']
+        candidate_refs = []
         
         for p in raw_predictions:
             if any(name in p['class'].lower() for name in target_names):
                 candidate_refs.append(p)
 
-        # SORTING MAGIC:
-        # Sort first by Name Priority (Score), THEN by Confidence
-        # This forces 'Reference' (Score 100) to beat 'referance' (Score 50) even if confidence is lower.
+        # Sort: High Priority Name -> High Confidence
         candidate_refs.sort(key=lambda x: (get_reference_score(x['class']), x['confidence']), reverse=True)
 
         if candidate_refs:
-            # Pick the winner
             reference_prediction = candidate_refs[0]
             pixel_size = max(reference_prediction['width'], reference_prediction['height'])
             calculated_ppm = pixel_size / ref_size_mm
-            
-            if debug_mode: 
-                st.success(f"✅ SELECTED REFERENCE: '{reference_prediction['class']}' (Score: {get_reference_score(reference_prediction['class'])}, Conf: {reference_prediction['confidence']:.2f})")
 
         final_ppm = calculated_ppm if calculated_ppm else manual_ppm
         
-        # --- 3. PROCESSING & DRAWING ---
+        # --- 3. DRAWING & FILTERING ---
         processed_image = image_bgr.copy()
         current_batch_data = []
 
-        # Draw Candidate References (Cyan) - Debug Only
-        if debug_mode:
-            for cand in candidate_refs:
-                if cand == reference_prediction: continue
-                x1 = int(cand['x'] - cand['width']/2)
-                y1 = int(cand['y'] - cand['height']/2)
-                x2 = int(cand['x'] + cand['width']/2)
-                y2 = int(cand['y'] + cand['height']/2)
-                cv2.rectangle(processed_image, (x1, y1), (x2, y2), (255, 255, 0), 1) 
-                cv2.putText(processed_image, cand['class'], (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-
-        # Draw Selected Reference (Thick Yellow)
+        # Draw Reference (Yellow)
         if reference_prediction:
             p = reference_prediction
             x1, y1 = int(p['x'] - p['width']/2), int(p['y'] - p['height']/2)
             x2, y2 = int(p['x'] + p['width']/2), int(p['y'] + p['height']/2)
-            cv2.rectangle(processed_image, (x1, y1), (x2, y2), (0, 255, 255), 3) # Yellow
+            cv2.rectangle(processed_image, (x1, y1), (x2, y2), (0, 255, 255), 3)
             cv2.putText(processed_image, "REF", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        elif debug_mode:
-            st.error("❌ No Reference object selected from candidates.")
+        else:
+            # Subtle warning on the image itself if no ref found
+            cv2.putText(processed_image, "NO REFERENCE FOUND", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
 
         # --- 4. MEASURE ONIONS ---
         user_conf_decimal = conf_threshold / 100.0
         cam_h_mm = camera_height_cm * 10.0
 
         for p in raw_predictions:
-            # Skip the specific reference object instance
             if p == reference_prediction: continue
-            
-            # Skip other candidates (don't count the 'fake' reference as an onion)
-            if p in candidate_refs: continue
-
+            if p in candidate_refs: continue # Skip ignored references
             if p['confidence'] < user_conf_decimal: continue
 
             x_c, y_c, w_px, h_px = p['x'], p['y'], p['width'], p['height']
@@ -187,73 +154,85 @@ def main():
     st.set_page_config(page_title="AgriGrade Procurement", layout="wide")
     st.title("🧅 Onion Procurement System")
     
-    # --- SIDEBAR ---
-    st.sidebar.header("⚙️ Configuration")
+    # --- SIDEBAR: CLEAN & ORGANIZED ---
+    st.sidebar.header("1. Reference Setup")
     ref_type = st.sidebar.selectbox("Reference Object", ["25mm Coin", "85mm Card", "Custom"])
-    ref_size_mm = 25.0 if ref_type == "25mm Coin" else 85.6 if ref_type == "85mm Card" else st.sidebar.number_input("Custom (mm)", 1.0, 500.0, 50.0)
+    if ref_type == "25mm Coin": ref_size_mm = 25.0
+    elif ref_type == "85mm Card": ref_size_mm = 85.6
+    else: ref_size_mm = st.sidebar.number_input("Custom Diameter (mm)", 1.0, 500.0, 50.0)
 
     st.sidebar.divider()
-    st.sidebar.subheader("📐 Capture Conditions")
-    
-    stance = st.sidebar.radio("Photographer Stance", ["Standing (Standard)", "Sitting/Table", "Custom"], index=0)
+    st.sidebar.header("2. Camera Height")
+    stance = st.sidebar.radio("Photographer Position", ["Standing (Standard)", "Sitting/Table", "Custom"], index=0)
     
     if stance == "Standing (Standard)":
         camera_height_cm = 120  
-        st.sidebar.caption("Using default height: 120cm")
     elif stance == "Sitting/Table":
         camera_height_cm = 60   
-        st.sidebar.caption("Using default height: 60cm")
     else:
-        camera_height_cm = st.sidebar.number_input("Custom Height (cm)", 30, 200, 120)
+        camera_height_cm = st.sidebar.number_input("Height from ground (cm)", 30, 200, 120)
 
-    ignore_edges = st.sidebar.checkbox("Ignore Edge Onions", value=True)
-    debug_mode = st.sidebar.checkbox("🕵️ Show Debug Info", value=False)
+    # COLLAPSIBLE ADVANCED SETTINGS
+    with st.sidebar.expander("⚙️ Advanced Settings"):
+        st.caption("Technical adjustments for the AI.")
+        ignore_edges = st.checkbox("Ignore Edge Onions", value=True, help="Removes partial onions touching the border.")
+        conf = st.slider("AI Sensitivity %", 10, 100, 40)
+        manual_ppm = st.number_input("Fallback Scale (px/mm)", 0.1, 100.0, 5.0)
 
-    conf = st.sidebar.slider("AI Confidence %", 10, 100, 40)
-    manual_ppm = st.sidebar.number_input("Fallback Scale", 0.1, 100.0, 5.0)
-
-    if st.sidebar.button("🗑️ Clear Data"):
+    st.sidebar.divider()
+    if st.sidebar.button("🗑️ Start New Report", use_container_width=True):
         st.session_state['master_data'] = pd.DataFrame(columns=["Batch ID", "Diameter (mm)", "Grade"])
         st.session_state['batch_counter'] = 0
         st.rerun()
 
     model, err = load_model()
     if err: 
-        st.error(f"API Error: {err}. Check Secrets.")
+        st.error(f"System Error: {err}. Please check API Key.")
         st.stop()
 
-    # --- MAIN ---
+    # --- MAIN INTERFACE ---
     col1, col2 = st.columns([1, 1])
     
     with col1:
-        st.subheader("1. Detect & Verify")
-        uploaded_file = st.file_uploader("Upload Image", type=['jpg', 'jpeg', 'png'])
+        st.subheader("📷 Scan Image")
+        uploaded_file = st.file_uploader("Upload photo of onions", type=['jpg', 'jpeg', 'png'])
+        
         if uploaded_file:
             img = Image.open(uploaded_file)
             img = correct_orientation(img)
             img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
             
-            processed, data, ppm = process_onions(model, img_bgr, manual_ppm, conf, ref_size_mm, camera_height_cm, ignore_edges, debug_mode)
+            with st.spinner("Processing..."):
+                processed, data, ppm = process_onions(model, img_bgr, manual_ppm, conf, ref_size_mm, camera_height_cm, ignore_edges)
             
-            st.image(cv2.cvtColor(processed, cv2.COLOR_BGR2RGB), caption=f"Analyzed (Stance: {stance} | H: {camera_height_cm}cm)", use_container_width=True)
+            st.image(cv2.cvtColor(processed, cv2.COLOR_BGR2RGB), use_container_width=True)
             
-            if data and st.button("✅ Add to Report"):
-                batch = pd.DataFrame(data)
-                batch["Batch ID"] = st.session_state['batch_counter'] + 1
-                st.session_state['master_data'] = pd.concat([st.session_state['master_data'], batch], ignore_index=True)
-                st.session_state['batch_counter'] += 1
-                st.success("Batch Added!"); st.rerun()
+            if data:
+                st.success(f"Detected **{len(data)}** onions.")
+                if st.button("✅ Add Batch to Report", type="primary", use_container_width=True):
+                    batch = pd.DataFrame(data)
+                    batch["Batch ID"] = st.session_state['batch_counter'] + 1
+                    st.session_state['master_data'] = pd.concat([st.session_state['master_data'], batch], ignore_index=True)
+                    st.session_state['batch_counter'] += 1
+                    st.rerun()
+            else:
+                st.warning("No onions detected. Try moving closer or adjusting lighting.")
 
     with col2:
-        st.subheader("2. Cumulative Report")
+        st.subheader("📊 Procurement Report")
         df = st.session_state['master_data']
+        
         if not df.empty:
+            # Key Metrics
             m1, m2, m3 = st.columns(3)
-            m1.metric("Count", len(df))
+            m1.metric("Total Count", len(df))
             m2.metric("Batches", st.session_state['batch_counter'])
             m3.metric("Avg Size", f"{df['Diameter (mm)'].mean():.1f} mm")
             
-            st.markdown("### 📊 Grade Breakdown")
+            st.divider()
+            
+            # Distribution Table
+            st.markdown("**Grade Distribution**")
             counts = df['Grade'].value_counts()
             for g in GRADE_STANDARDS: 
                 if g not in counts: counts[g] = 0
@@ -261,9 +240,20 @@ def main():
             
             summary = [{"Grade": g, "Count": c, "%": f"{(c/len(df)*100):.1f}%"} for g, c in counts.items()]
             st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
+            
             st.bar_chart(counts)
             
-            st.download_button("📥 Download CSV", df.to_csv(index=False).encode('utf-8'), "onion_report.csv", "text/csv", type="primary")
+            # Download
+            st.download_button(
+                "📥 Download Final CSV", 
+                df.to_csv(index=False).encode('utf-8'), 
+                "procurement_report.csv", 
+                "text/csv", 
+                type="primary",
+                use_container_width=True
+            )
+        else:
+            st.info("👋 **Welcome!**\n\n1. Upload an image on the left.\n2. Click 'Add Batch' to build your report.\n3. Download the final CSV here.")
 
     gc.collect()
 
