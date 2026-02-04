@@ -26,7 +26,6 @@ if 'batch_counter' not in st.session_state:
 
 @st.cache_resource
 def load_model():
-    # Attempt to load secret; default to empty if not found (will error later safely)
     api_key = st.secrets.get("ROBOFLOW_API_KEY", "")
     try:
         rf = Roboflow(api_key=api_key)
@@ -54,26 +53,35 @@ def determine_grade(diameter_mm):
         if min_d <= diameter_mm < max_d: return grade
     return "Unknown"
 
-def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm, camera_height_cm, ignore_edges):
+def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm, camera_height_cm, ignore_edges, debug_mode):
     try:
         img_h, img_w = image_bgr.shape[:2]
-        edge_margin = 25 # Slightly increased margin for safety
+        edge_margin = 25 
 
         cv2.imwrite("temp_inference.jpg", image_bgr)
-        # Low confidence to catch reference
-        response = model.predict("temp_inference.jpg", confidence=10).json()
+        
+        # EXTREMELY LOW Confidence (1%) to find everything
+        response = model.predict("temp_inference.jpg", confidence=1).json()
         raw_predictions = response.get('predictions', [])
+
+        # --- DEBUG PRINT ---
+        if debug_mode:
+            st.warning("🕵️ DEBUG: Raw Detections from AI")
+            debug_list = [f"{p['class']} ({p['confidence']:.2f})" for p in raw_predictions]
+            st.write(debug_list)
 
         # --- CALIBRATION ---
         calculated_ppm = None
         reference_prediction = None
-        target_names = ['reference', 'ref', 'coin', 'card', 'marker']
+        # Expanded list of possible names
+        target_names = ['reference', 'ref', 'coin', 'card', 'marker', 'scale', 'token', 'calibration']
         
         for p in raw_predictions:
             if any(name in p['class'].lower() for name in target_names):
                 pixel_size = max(p['width'], p['height'])
                 calculated_ppm = pixel_size / ref_size_mm
                 reference_prediction = p
+                if debug_mode: st.success(f"✅ FOUND REFERENCE: {p['class']}")
                 break 
 
         final_ppm = calculated_ppm if calculated_ppm else manual_ppm
@@ -89,6 +97,8 @@ def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm, ca
             x2, y2 = int(p['x'] + p['width']/2), int(p['y'] + p['height']/2)
             cv2.rectangle(processed_image, (x1, y1), (x2, y2), (255, 255, 0), 3)
             cv2.putText(processed_image, "REF", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        elif debug_mode:
+            st.error("❌ Reference NOT found in this list.")
 
         user_conf_decimal = conf_threshold / 100.0
         cam_h_mm = camera_height_cm * 10.0
@@ -97,24 +107,21 @@ def process_onions(model, image_bgr, manual_ppm, conf_threshold, ref_size_mm, ca
             if p == reference_prediction: continue
             if p['confidence'] < user_conf_decimal: continue
 
+            # Prevent detecting the reference as an onion if names are similar
+            if any(name in p['class'].lower() for name in target_names): continue
+
             x_c, y_c, w_px, h_px = p['x'], p['y'], p['width'], p['height']
             x1, y1 = int(x_c - w_px/2), int(y_c - h_px/2)
             x2, y2 = int(x_c + w_px/2), int(y_c + h_px/2)
 
-            # Edge Filter
             if ignore_edges:
                 if x1 < edge_margin or y1 < edge_margin or x2 > (img_w - edge_margin) or y2 > (img_h - edge_margin):
                     continue 
 
             # --- GEOMETRIC SIZE CORRECTION ---
-            # 1. Raw Size (Floor level)
             raw_diameter_mm = max(w_px, h_px) / final_ppm
-            
-            # 2. Correction
-            # Estimate radius (height of the onion surface from floor)
             estimated_radius = raw_diameter_mm / 2.0
             
-            # Factor = (Camera_Height - Onion_Height) / Camera_Height
             if cam_h_mm > 0:
                 correction_factor = (cam_h_mm - estimated_radius) / cam_h_mm
             else:
@@ -147,19 +154,20 @@ def main():
     st.sidebar.divider()
     st.sidebar.subheader("📐 Capture Conditions")
     
-    # NEW: Simplified Stance Selector
     stance = st.sidebar.radio("Photographer Stance", ["Standing (Standard)", "Sitting/Table", "Custom"], index=0)
     
     if stance == "Standing (Standard)":
-        camera_height_cm = 120  # Safe average for standing
+        camera_height_cm = 120  
         st.sidebar.caption("Using default height: 120cm")
     elif stance == "Sitting/Table":
-        camera_height_cm = 60   # Safe average for sitting at a table
+        camera_height_cm = 60   
         st.sidebar.caption("Using default height: 60cm")
     else:
         camera_height_cm = st.sidebar.number_input("Custom Height (cm)", 30, 200, 120)
 
-    ignore_edges = st.sidebar.checkbox("Ignore Edge Onions", value=True, help="Removes partial onions at borders.")
+    ignore_edges = st.sidebar.checkbox("Ignore Edge Onions", value=True)
+    debug_mode = st.sidebar.checkbox("🕵️ Show Debug Info", value=False, help="Check this to see what the AI detects")
+
     conf = st.sidebar.slider("AI Confidence %", 10, 100, 40)
     manual_ppm = st.sidebar.number_input("Fallback Scale", 0.1, 100.0, 5.0)
 
@@ -184,7 +192,7 @@ def main():
             img = correct_orientation(img)
             img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
             
-            processed, data, ppm = process_onions(model, img_bgr, manual_ppm, conf, ref_size_mm, camera_height_cm, ignore_edges)
+            processed, data, ppm = process_onions(model, img_bgr, manual_ppm, conf, ref_size_mm, camera_height_cm, ignore_edges, debug_mode)
             
             st.image(cv2.cvtColor(processed, cv2.COLOR_BGR2RGB), caption=f"Analyzed (Stance: {stance} | H: {camera_height_cm}cm)", use_container_width=True)
             
